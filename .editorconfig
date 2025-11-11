@@ -51,3 +51,11 @@ x-soft-wrap-text = false
 
 [*keywords.list]
 insert_final_newline = false
+
+[*.json]
+indent_style = space
+indent_size = 2
+
+[Dockerfile.*]
+indent_style = space
+indent_size = 2

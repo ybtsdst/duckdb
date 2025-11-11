@@ -1,5 +1,12 @@
 cmake_minimum_required(VERSION 3.5...3.29)
 
+# enable ccache
+find_program(CCACHE_PROGRAM ccache)
+if(CCACHE_PROGRAM)
+    set(CMAKE_C_COMPILER_LAUNCHER "${CCACHE_PROGRAM}") 
+    set(CMAKE_CXX_COMPILER_LAUNCHER "${CCACHE_PROGRAM}")
+endif()
+
 if(NOT CLANG_TIDY)
   find_package(Python3)
 endif()
