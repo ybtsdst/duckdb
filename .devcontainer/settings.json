@@ -34,13 +34,13 @@
         "--cross-file-rename",
         "--compile-commands-dir=/opt/transwarp/duckdb/build/debug",
         "--completion-style=detailed",
-        "-j=4",
+        "-j=80",
         "--all-scopes-completion",
         // "--limit-references=100",
         // "--limit-results=20",
         "--malloc-trim"
     ],
-    "terminal.integrated.shell.linux": {
+    "terminal.integrated.profiles.linux": {
         "bash (login)": {
             "path": "/bin/bash",
             "args": [
