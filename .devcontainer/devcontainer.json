@@ -24,7 +24,7 @@
         "codezombiech.gitignore",
         "SonarSource.sonarlint-vscode",
         "GitHub.copilot",
-        "zxh404.vscode-proto3",
+        "DrBlury.protobuf-vsc",
         "llvm-vs-code-extensions.vscode-clangd",
         "eamodio.gitlens"
       ]

@@ -2,6 +2,7 @@
 
 common_build_args="
   --network=host
+  --build-arg HTTP_PROXY=${HTTP_PROXY}
 "
 
 function image_suffix {

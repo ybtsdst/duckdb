@@ -4,6 +4,7 @@ ARG HTTP_PROXY
 ARG DEV_USERNAME
 ARG USER_UID
 ARG USER_GID
+ARG GO_VERSION=1.24.9
 
 ENV DEBIAN_FRONTEND=noninteractive    
 ENV http_proxy=${HTTP_PROXY}
@@ -29,6 +30,7 @@ RUN \
   apt-get update -y && \    
   PKGS="vim sudo locales git curl unzip wget zip iputils-ping iproute2 tzdata tree jq" && \    
   PKGS="${PKGS} gdb net-tools telnet cmake ninja-build ccache linux-tools-common linux-tools-generic" && \    
+  PKGS="${PKGS} google-perftools valgrind" && \    
   apt-get install -y ${PKGS} && \    
   locale-gen en_US.UTF-8 && \    
   echo ${TZ} > /etc/timezone && \
@@ -67,8 +69,21 @@ RUN \
   && echo $DEV_USERNAME ALL=\(root\) NOPASSWD:ALL > /etc/sudoers.d/$DEV_USERNAME \
   && chmod 0440 /etc/sudoers.d/$DEV_USERNAME
 
+RUN \
+  # Install Go
+  wget "https://go.dev/dl/go${GO_VERSION}.linux-amd64.tar.gz" -O /tmp/go.tar.gz && \
+  tar -C /usr/local -xzf /tmp/go.tar.gz && \
+  rm -rf /tmp/go.tar.gz
+
+ENV GOPATH=/opt/go
+ENV GOPROXY=https://goproxy.cn,direct
+ENV GOSUMDB=off
+ENV PATH=/usr/local/go/bin:${GOPATH}/bin:${PATH}
+
 ENV LC_ALL="en_US.UTF-8"
 ENV LANG="en_US.UTF-8"
+
+RUN go install github.com/google/pprof@latest
 
 USER $DEV_USERNAME
 
