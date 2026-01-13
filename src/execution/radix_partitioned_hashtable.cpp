@@ -8,6 +8,8 @@
 #include "duckdb/execution/executor.hpp"
 #include "duckdb/execution/ht_entry.hpp"
 #include "duckdb/execution/operator/aggregate/physical_hash_aggregate.hpp"
+#include "duckdb/logging/logger.hpp"
+#include "duckdb/main/client_context.hpp"
 #include "duckdb/planner/expression/bound_reference_expression.hpp"
 #include "duckdb/storage/temporary_memory_manager.hpp"
 
@@ -219,7 +221,7 @@ RadixHTGlobalSinkState::RadixHTGlobalSinkState(ClientContext &context_p, const R
 	if (!radix_ht.GetLayout().AllConstant()) {
 		blocks_per_partition += 1;
 	}
-	auto ht_size = num_partitions * blocks_per_partition * block_alloc_size + config.sink_capacity * sizeof(ht_entry_t);
+	auto ht_size = num_partitions * blocks_per_partition * block_alloc_size + config.sink_capacity * sizeof(ht_entry_t) + 256 * block_alloc_size;
 
 	// This really is the minimum reservation that we can do
 	auto num_threads = NumericCast<idx_t>(TaskScheduler::GetScheduler(context).NumberOfThreads());
@@ -443,6 +445,10 @@ void MaybeRepartition(ClientContext &context, RadixHTGlobalSinkState &gstate, Ra
 	const auto total_size =
 	    aggregate_allocator_size + ht.GetPartitionedData().SizeInBytes() + ht.Capacity() * sizeof(ht_entry_t);
 	idx_t thread_limit = temporary_memory_state.GetReservation() / gstate.number_of_threads;
+	if (ht.GetUnpartitionedData() && ht.GetUnpartitionedData()->SizeInBytes() > 0) {
+		DUCKDB_LOG_DEBUG(*context.db, "miss unparititioned data size: %llu", ht.GetUnpartitionedData()->SizeInBytes());
+	}
+
 	if (total_size > thread_limit) {
 		// We're over the thread memory limit
 		if (!gstate.external) {
@@ -469,8 +475,10 @@ void MaybeRepartition(ClientContext &context, RadixHTGlobalSinkState &gstate, Ra
 				    BufferManager::GetBufferManager(context), gstate.radix_ht.GetLayoutPtr(), config.GetRadixBits(),
 				    gstate.radix_ht.GetLayout().ColumnCount() - 1);
 			}
+			DUCKDB_LOG_DEBUG(*context.db, "starts to repartition to abandoned_data");
 			ht.SetRadixBits(gstate.config.GetRadixBits());
 			ht.AcquirePartitionedData()->Repartition(context, *lstate.abandoned_data);
+			DUCKDB_LOG_DEBUG(*context.db, "repartition finished");
 		}
 	}
 
@@ -501,6 +509,24 @@ void MaybeRepartition(ClientContext &context, RadixHTGlobalSinkState &gstate, Ra
 	ht.Repartition();
 }
 
+void DumpMemoryUsage(ClientContext &context, RadixHTGlobalSinkState &gstate, RadixHTLocalSinkState &lstate) {
+	auto &ht = *lstate.ht;
+	auto &temporary_memory_state = *gstate.temporary_memory_state;
+	const auto aggregate_allocator_size = ht.GetAggregateAllocator()->AllocationSize();
+	const auto total_size =
+	    aggregate_allocator_size + ht.GetPartitionedData().SizeInBytes() + ht.Capacity() * sizeof(ht_entry_t);
+	idx_t thread_limit = temporary_memory_state.GetReservation() / gstate.number_of_threads;
+	uint32_t unpartitioned_size = 0;
+	if (ht.GetUnpartitionedData() && ht.GetUnpartitionedData()->SizeInBytes() > 0) {
+		unpartitioned_size = ht.GetUnpartitionedData()->SizeInBytes();
+	}
+	DUCKDB_LOG_DEBUG(*context.db,
+	                 "total size: %ld thread limit: %ld unpartition_size: %ld need to repartion to abandoned_data: %s "
+	                 "need to repartition to abandoned_data(with unpartition): %s",
+	                 total_size, thread_limit, unpartitioned_size, (total_size > thread_limit) ? "true" : "false",
+	                 (total_size + unpartitioned_size> thread_limit) ? "true" : "false");
+}
+
 void RadixPartitionedHashTable::Sink(ExecutionContext &context, DataChunk &chunk, OperatorSinkInput &input,
                                      DataChunk &payload_input, const unsafe_vector<idx_t> &filter) const {
 	auto &gstate = input.global_state.Cast<RadixHTGlobalSinkState>();
@@ -518,11 +544,17 @@ void RadixPartitionedHashTable::Sink(ExecutionContext &context, DataChunk &chunk
 		gstate.active_threads++;
 	}
 
+	DUCKDB_LOG_DEBUG(*context.client.db, "Before add chunk");
+	DumpMemoryUsage(context.client, gstate, lstate);
+
 	auto &group_chunk = lstate.group_chunk;
 	PopulateGroupChunk(group_chunk, chunk);
 
 	auto &ht = *lstate.ht;
 	ht.AddChunk(group_chunk, payload_input, filter);
+
+	DUCKDB_LOG_DEBUG(*context.client.db, "After add chunk");
+	DumpMemoryUsage(context.client, gstate, lstate);
 
 	// Decide whether we should adapt our strategy to the data
 	if (!lstate.adapted && lstate.ht->GetSinkCount() >= RadixHTLocalSinkState::ADAPTIVITY_THRESHOLD) {
@@ -530,6 +562,8 @@ void RadixPartitionedHashTable::Sink(ExecutionContext &context, DataChunk &chunk
 		ht.EnableHLL(false); // Can be disabled now (costs 5-10% performance in worst case, single column distinct)
 		lstate.adapted = true;
 	}
+
+	DUCKDB_LOG_DEBUG(*context.client.db, "ht count: %d capacity: %d", ht.Count(), ht.Capacity());
 
 	if (ht.Count() + STANDARD_VECTOR_SIZE < GroupedAggregateHashTable::ResizeThreshold(lstate.local_sink_capacity)) {
 		return; // We can fit another chunk
@@ -539,7 +573,10 @@ void RadixPartitionedHashTable::Sink(ExecutionContext &context, DataChunk &chunk
 		// 'Reset' the HT without taking its data, we can just keep appending to the same collection
 		// This only works because we never resize the HT
 		// We don't do this when running with 1 or 2 threads, it only makes sense when there's many threads
+		static uint32_t count = 1;
+		DUCKDB_LOG_DEBUG(context, "abandon due to external: %d", count++);
 		ht.Abandon();
+		DUCKDB_LOG_DEBUG(context, "abandon finished");
 	}
 
 	// Check if we need to repartition
@@ -549,11 +586,17 @@ void RadixPartitionedHashTable::Sink(ExecutionContext &context, DataChunk &chunk
 
 	if (repartitioned && ht.Count() != 0) {
 		// We repartitioned, but we didn't clear the pointer table / reset the count because we're on 1 or 2 threads
+		static uint32_t count = 1;
+		DUCKDB_LOG_DEBUG(context, "abandon due to repartitioned: %d", count++);
 		ht.Abandon();
+		DUCKDB_LOG_DEBUG(context, "abandon finished");
 		if (gstate.external) {
 			ht.Resize(lstate.local_sink_capacity);
 		}
 	}
+
+	DUCKDB_LOG_DEBUG(*context.client.db, "After post-process");
+	DumpMemoryUsage(context.client, gstate, lstate);
 
 	// TODO: combine early and often
 }

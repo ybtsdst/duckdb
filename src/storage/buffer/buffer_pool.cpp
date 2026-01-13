@@ -2,8 +2,10 @@
 
 #include "duckdb/common/allocator.hpp"
 #include "duckdb/common/chrono.hpp"
+#include "duckdb/common/enum_util.hpp"
 #include "duckdb/common/exception.hpp"
 #include "duckdb/common/typedefs.hpp"
+#include "duckdb/logging/logger.hpp"
 #include "duckdb/parallel/concurrentqueue.hpp"
 #include "duckdb/parallel/task_scheduler.hpp"
 #include "duckdb/storage/block_allocator.hpp"
@@ -231,12 +233,12 @@ void EvictionQueue::PurgeIteration(const idx_t purge_size) {
 }
 
 BufferPool::BufferPool(BlockAllocator &block_allocator, idx_t maximum_memory, bool track_eviction_timestamps,
-                       idx_t allocator_bulk_deallocation_flush_threshold)
+                       idx_t allocator_bulk_deallocation_flush_threshold, DatabaseInstance *database)
     : eviction_queue_sizes({BLOCK_AND_EXTERNAL_FILE_QUEUE_SIZE, MANAGED_BUFFER_QUEUE_SIZE, TINY_BUFFER_QUEUE_SIZE}),
       maximum_memory(maximum_memory),
       allocator_bulk_deallocation_flush_threshold(allocator_bulk_deallocation_flush_threshold),
       track_eviction_timestamps(track_eviction_timestamps),
-      temporary_memory_manager(make_uniq<TemporaryMemoryManager>()), block_allocator(block_allocator) {
+      temporary_memory_manager(make_uniq<TemporaryMemoryManager>()), block_allocator(block_allocator), db(database) {
 	for (idx_t queue_type_idx = 0; queue_type_idx < EVICTION_QUEUE_TYPES; queue_type_idx++) {
 		const auto types = EvictionQueueTypeIdxToFileBufferTypes(queue_type_idx);
 		const auto &type_queue_size = eviction_queue_sizes[queue_type_idx];
@@ -346,6 +348,8 @@ BufferPool::EvictionResult BufferPool::EvictBlocksInternal(EvictionQueue &queue,
 			// we can re-use the memory directly
 			*buffer = handle->UnloadAndTakeBlock(lock);
 			found = true;
+			DUCKDB_LOG_DEBUG(*db, "Re-using buffer from block handle id: %ld tag: %s", handle->BlockId(),
+			                 EnumUtil::ToChars<>(handle->GetMemoryTag()));
 			return false;
 		}
 
@@ -354,8 +358,12 @@ BufferPool::EvictionResult BufferPool::EvictBlocksInternal(EvictionQueue &queue,
 
 		if (memory_usage.GetUsedMemory(MemoryUsageCaches::NO_FLUSH) <= memory_limit) {
 			found = true;
+			DUCKDB_LOG_DEBUG(*db, "Unload block: id=%ld tag=%s; but not reuse its memory", handle->BlockId(),
+			                 EnumUtil::ToChars<>(handle->GetMemoryTag()));
 			return false;
 		}
+		DUCKDB_LOG_DEBUG(*db, "Unload block: id=%ld tag=%s; continue iteration", handle->BlockId(),
+		                 EnumUtil::ToChars<>(handle->GetMemoryTag()));
 
 		// Continue iteration
 		return true;
@@ -502,6 +510,33 @@ void BufferPool::MemoryUsage::UpdateUsedMemory(MemoryTag tag, int64_t size) {
 		// update global counter
 		memory_usage[tag_idx].fetch_add(size, std::memory_order_relaxed);
 		memory_usage[TOTAL_MEMORY_USAGE_INDEX].fetch_add(size, std::memory_order_relaxed);
+	}
+}
+
+void BufferPool::DumpQueueInfo(const BlockHandle &block) {
+	static bool run_once = false;
+	if (run_once) {
+		return;
+	}
+
+	run_once = true;
+	// uint32_t count = 0;
+	// EvictionQueue &queue = GetEvictionQueueForBlockHandle(block);
+	// queue.IterateUnloadableBlocks([&](BufferEvictionNode &, const shared_ptr<BlockHandle> &handle, BlockLock &lock) {
+	// 	count++;
+	// 	return true;
+	// });
+	// DUCKDB_LOG_DEBUG(*db, "current total unloadable blocks in queue for block id %ld tag %s: %u", block.BlockId(),
+	//                  EnumUtil::ToChars(block.GetMemoryTag()), count);
+	for (size_t i = 0; i < queues.size(); i++) {
+		uint32_t tmp = 0;
+		EvictionQueue &current_queue = *queues[i];
+		current_queue.IterateUnloadableBlocks(
+		    [&](BufferEvictionNode &, const shared_ptr<BlockHandle> &handle, BlockLock &lock) {
+			    tmp++;
+			    return true;
+		    });
+		DUCKDB_LOG_DEBUG(*db, "current total unloadable blocks in queue[%ld]: %u", i, tmp);
 	}
 }
 

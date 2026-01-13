@@ -4,8 +4,10 @@
 #include "duckdb/common/enums/memory_tag.hpp"
 #include "duckdb/common/exception.hpp"
 #include "duckdb/common/set.hpp"
+#include "duckdb/logging/logger.hpp"
 #include "duckdb/main/attached_database.hpp"
 #include "duckdb/main/database.hpp"
+#include "duckdb/storage/buffer/block_handle.hpp"
 #include "duckdb/storage/buffer/buffer_pool.hpp"
 #include "duckdb/storage/in_memory_block_manager.hpp"
 #include "duckdb/storage/storage_manager.hpp"
@@ -175,6 +177,8 @@ shared_ptr<BlockHandle> StandardBufferManager::RegisterMemory(MemoryTag tag, idx
 	    tag == MemoryTag::EXTERNAL_FILE_CACHE ? FileBufferType::EXTERNAL_FILE : FileBufferType::MANAGED_BUFFER;
 	auto buffer = ConstructManagedBuffer(block_size, block_header_size, std::move(reusable_buffer), file_buffer_type);
 	const auto destroy_buffer_upon = can_destroy ? DestroyBufferUpon::EVICTION : DestroyBufferUpon::BLOCK;
+	DUCKDB_LOG_DEBUG(db, "create block handle id: %s tag: %s size: %s", std::to_string(temporary_id + 1),
+	                 EnumUtil::ToChars<>(tag), StringUtil::BytesToHumanReadableString(alloc_size));
 	return make_shared_ptr<BlockHandle>(*temp_block_manager, ++temporary_id, tag, std::move(buffer),
 	                                    destroy_buffer_upon, alloc_size, std::move(res));
 }
@@ -500,6 +504,8 @@ void StandardBufferManager::WriteTemporaryBuffer(MemoryTag tag, block_id_t block
 	// WriteTemporaryBuffer assumes that we never write a buffer below DEFAULT_BLOCK_ALLOC_SIZE.
 	RequireTemporaryDirectory();
 
+	DUCKDB_LOG_DEBUG(db, "Writing temporary buffer for block id %ld", block_id);
+
 	// Append to a few grouped files.
 	if (buffer.AllocSize() == GetBlockAllocSize()) {
 		idx_t eviction_size = temporary_directory.handle->GetTempFile().WriteTemporaryBuffer(block_id, buffer);
@@ -544,6 +550,10 @@ unique_ptr<FileBuffer> StandardBufferManager::ReadTemporaryBuffer(QueryContext c
                                                                   BlockHandle &block,
                                                                   unique_ptr<FileBuffer> reusable_buffer) {
 	D_ASSERT(!temporary_directory.path.empty());
+	DUCKDB_LOG_DEBUG(db, "read block id %ld state %s: reuse: %s", block.BlockId(),
+	                 block.GetState() == BlockState::BLOCK_LOADED ? "LOADED" : "UNLOADED",
+	                 reusable_buffer ? "true" : "false");
+	// buffer_pool.DumpQueueInfo(block);
 	auto id = block.BlockId();
 	if (!temporary_directory.handle) {
 		throw InternalException("ReadTemporaryBuffer called but temporary directory has not been instantiated yet");

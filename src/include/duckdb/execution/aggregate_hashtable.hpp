@@ -96,6 +96,7 @@ public:
 	void FindOrCreateGroups(DataChunk &groups, Vector &addresses_out);
 
 	const PartitionedTupleData &GetPartitionedData() const;
+	const unique_ptr<PartitionedTupleData> &GetUnpartitionedData() const;
 	unique_ptr<PartitionedTupleData> AcquirePartitionedData();
 	void Abandon();
 	void Repartition();
