@@ -6,7 +6,9 @@
 #include "duckdb/common/radix_partitioning.hpp"
 #include "duckdb/common/row_operations/row_operations.hpp"
 #include "duckdb/common/types/null_value.hpp"
+#include "duckdb/common/types/row/partitioned_tuple_data.hpp"
 #include "duckdb/common/types/row/tuple_data_iterator.hpp"
+#include "duckdb/common/unique_ptr.hpp"
 #include "duckdb/common/vector_operations/vector_operations.hpp"
 #include "duckdb/execution/expression_executor.hpp"
 #include "duckdb/execution/ht_entry.hpp"
@@ -103,6 +105,10 @@ void GroupedAggregateHashTable::InitializeUnpartitionedData() {
 
 const PartitionedTupleData &GroupedAggregateHashTable::GetPartitionedData() const {
 	return *partitioned_data;
+}
+
+const unique_ptr<PartitionedTupleData> &GroupedAggregateHashTable::GetUnpartitionedData() const {
+	return unpartitioned_data;
 }
 
 unique_ptr<PartitionedTupleData> GroupedAggregateHashTable::AcquirePartitionedData() {

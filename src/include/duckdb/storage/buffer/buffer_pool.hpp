@@ -13,6 +13,7 @@
 #include "duckdb/common/file_buffer.hpp"
 #include "duckdb/common/mutex.hpp"
 #include "duckdb/common/typedefs.hpp"
+#include "duckdb/main/database.hpp"
 #include "duckdb/storage/buffer/block_handle.hpp"
 
 namespace duckdb {
@@ -42,7 +43,7 @@ class BufferPool {
 
 public:
 	BufferPool(BlockAllocator &block_allocator, idx_t maximum_memory, bool track_eviction_timestamps,
-	           idx_t allocator_bulk_deallocation_flush_threshold);
+	           idx_t allocator_bulk_deallocation_flush_threshold, DatabaseInstance* database = nullptr);
 	virtual ~BufferPool();
 
 	//! Set a new memory limit to the buffer pool, throws an exception if the new limit is too low and not enough
@@ -62,6 +63,8 @@ public:
 	virtual idx_t GetQueryMaxMemory() const;
 
 	TemporaryMemoryManager &GetTemporaryMemoryManager();
+
+	void DumpQueueInfo(const BlockHandle& block);
 
 protected:
 	//! Evict blocks until the currently used memory + extra_memory fit, returns false if this was not possible
@@ -163,6 +166,8 @@ protected:
 	mutable MemoryUsage memory_usage;
 	//! The block allocator
 	BlockAllocator &block_allocator;
+
+	DatabaseInstance* db;
 };
 
 } // namespace duckdb

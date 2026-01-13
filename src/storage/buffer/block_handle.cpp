@@ -1,6 +1,7 @@
 #include "duckdb/storage/buffer/block_handle.hpp"
 
 #include "duckdb/common/file_buffer.hpp"
+#include "duckdb/logging/logger.hpp"
 #include "duckdb/main/client_context.hpp"
 #include "duckdb/storage/block.hpp"
 #include "duckdb/storage/block_manager.hpp"
@@ -56,6 +57,8 @@ BlockHandle::~BlockHandle() { // NOLINT: allow internal exceptions
 		block_manager.UnregisterBlock(*this);
 	} catch (...) {
 	}
+	DUCKDB_LOG_DEBUG(block_manager.buffer_manager.GetDatabase(), "Destroyed block handle id: %s tag: %s", std::to_string(block_id),
+	                EnumUtil::ToChars<>(tag));
 }
 
 unique_ptr<Block> AllocateBlock(BlockManager &block_manager, unique_ptr<FileBuffer> reusable_buffer,
