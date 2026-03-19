@@ -1,0 +1,70 @@
+CREATE TABLE
+INSERT 0 1
+INSERT 0 1
+ a | b 
+---+---
+   | 3 
+   |   
+(2 rows)
+DROP TABLE
+CREATE TABLE
+ERROR:  null value in column "a" of relation "test" violates not-null constraint
+DETAIL:  Failing row contains (null, 3).
+DROP TABLE
+CREATE TABLE
+INSERT 0 1
+ a | b 
+---+---
+ 1 | 3 
+(1 row)
+DROP TABLE
+CREATE TABLE
+INSERT 0 1
+ a | b 
+---+---
+ 2 | 3 
+(1 row)
+DROP TABLE
+CREATE TABLE
+INSERT 0 1
+ a | b 
+---+---
+ 2 | 3 
+(1 row)
+DROP TABLE
+CREATE SEQUENCE
+CREATE TABLE
+INSERT 0 5
+ a | b 
+---+---
+ 1 | 2 
+ 2 | 4 
+ 3 | 6 
+ 4 | 2 
+ 5 | 4 
+(5 rows)
+ERROR:  cannot drop sequence seq because other objects depend on it
+DETAIL:  default value for column a of table test depends on sequence seq
+HINT:  Use DROP ... CASCADE to drop the dependent objects too.
+DROP TABLE
+DROP SEQUENCE
+CREATE SEQUENCE
+CREATE TABLE
+INSERT 0 1
+UPDATE 1
+ a | b 
+---+---
+ 2 | 1 
+(1 row)
+ERROR:  cannot use subquery in DEFAULT expression
+ERROR:  aggregate functions are not allowed in DEFAULT expressions
+ERROR:  window functions are not allowed in DEFAULT expressions
+ERROR:  column "b" does not exist
+DROP TABLE
+CREATE TABLE
+INSERT 0 1
+INSERT 0 1
+ count 
+-------
+ 2     
+(1 row)

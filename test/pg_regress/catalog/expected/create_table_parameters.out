@@ -1,0 +1,4 @@
+ERROR:  syntax error at or near "?"
+LINE 1: CREATE TABLE t0 ( c1 INT DEFAULT ? );
+ERROR:  syntax error at or near "?"
+LINE 1: CREATE TABLE t0 ( c1 INT CHECK (?) );
