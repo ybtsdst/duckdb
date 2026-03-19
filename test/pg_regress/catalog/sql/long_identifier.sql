@@ -1,5 +1,6 @@
 -- Converted from long_identifier.test
 -- DuckDB catalog/table test suite
+-- SQL is kept verbatim; run via PG-protocol-compatible DuckDB interface
 
 -- name: test/sql/catalog/table/long_identifier.test
 -- description: Test long identifiers (>= 64 bytes)

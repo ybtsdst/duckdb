@@ -12,11 +12,9 @@ INSERT 0 1
 ---
  2 
 (1 row)
-ERROR:  syntax error at or near "default"
-LINE 1: insert into x(i) default values;
+ERROR:  Parser Error
 DROP TABLE
 CREATE TABLE
 INSERT 0 1
-ERROR:  duplicate key value violates unique constraint "x_pkey"
-DETAIL:  Key (i)=(1) already exists.
+ERROR:  Constraint Error: Duplicate key "i: 1" violates primary key constraint for table "x"
 INSERT 0 0

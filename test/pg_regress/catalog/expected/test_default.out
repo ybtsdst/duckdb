@@ -8,8 +8,7 @@ INSERT 0 1
 (2 rows)
 DROP TABLE
 CREATE TABLE
-ERROR:  null value in column "a" of relation "test" violates not-null constraint
-DETAIL:  Failing row contains (null, 3).
+ERROR:  Constraint Error: NOT NULL constraint violated for column "a"
 DROP TABLE
 CREATE TABLE
 INSERT 0 1
@@ -43,9 +42,7 @@ INSERT 0 5
  4 | 2 
  5 | 4 
 (5 rows)
-ERROR:  cannot drop sequence seq because other objects depend on it
-DETAIL:  default value for column a of table test depends on sequence seq
-HINT:  Use DROP ... CASCADE to drop the dependent objects too.
+ERROR:  Catalog Error: Could not drop sequence "seq" because table "test" depends on it
 DROP TABLE
 DROP SEQUENCE
 CREATE SEQUENCE
@@ -56,10 +53,10 @@ UPDATE 1
 ---+---
  2 | 1 
 (1 row)
-ERROR:  cannot use subquery in DEFAULT expression
-ERROR:  aggregate functions are not allowed in DEFAULT expressions
-ERROR:  window functions are not allowed in DEFAULT expressions
-ERROR:  column "b" does not exist
+ERROR:  Binder Error: Default values cannot contain subqueries
+ERROR:  Binder Error: Aggregate functions are not supported in default values
+ERROR:  Binder Error: Window functions are not supported in default values
+ERROR:  Binder Error: Default expression refers to column "b" which is not yet defined
 DROP TABLE
 CREATE TABLE
 INSERT 0 1

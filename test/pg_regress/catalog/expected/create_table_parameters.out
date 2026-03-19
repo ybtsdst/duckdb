@@ -1,4 +1,2 @@
-ERROR:  syntax error at or near "?"
-LINE 1: CREATE TABLE t0 ( c1 INT DEFAULT ? );
-ERROR:  syntax error at or near "?"
-LINE 1: CREATE TABLE t0 ( c1 INT CHECK (?) );
+ERROR:  Parser Error: DEFAULT values cannot contain parameters
+ERROR:  Parser Error: Unrecognized token "?"

@@ -1,9 +1,12 @@
 -- Converted from test_default.test
 -- DuckDB catalog/table test suite
+-- SQL is kept verbatim; run via PG-protocol-compatible DuckDB interface
 
 -- name: test/sql/catalog/table/test_default.test
 -- description: Test DEFAULT in tables
 -- group: [table]
+PRAGMA enable_verification;
+
 -- no default specified: write NULL value
 CREATE TABLE test (a INTEGER, b INTEGER);
 

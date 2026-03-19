@@ -1,5 +1,6 @@
 -- Converted from test_many_columns.test
 -- DuckDB catalog/table test suite
+-- SQL is kept verbatim; run via PG-protocol-compatible DuckDB interface
 
 -- name: test/sql/catalog/table/test_many_columns.test
 -- description: Test many columns

@@ -1,12 +1,13 @@
 -- Converted from create_table_as_abort.test
 -- DuckDB catalog/table test suite
+-- SQL is kept verbatim; run via PG-protocol-compatible DuckDB interface
 
 -- name: test/sql/catalog/table/create_table_as_abort.test
 -- description: Test correct early abort of CREATE TABLE AS query when table already exists (#1891)
 -- group: [table]
 CREATE TABLE integers(i INTEGER);
 
-CREATE TABLE IF NOT EXISTS integers AS SELECT i1.i FROM generate_series(0, 10000000000000000-1) AS i1(i);
+CREATE TABLE IF NOT EXISTS integers AS SELECT i1.i FROM range(10000000000000000) i1(i);
 
-CREATE TABLE integers AS SELECT i1.i FROM generate_series(0, 10000000000000000-1) AS i1(i);
+CREATE TABLE integers AS SELECT i1.i FROM range(10000000000000000) i1(i);
 
