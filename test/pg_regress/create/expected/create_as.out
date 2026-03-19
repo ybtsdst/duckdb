@@ -1,0 +1,69 @@
+CREATE TABLE
+ 1 
+---
+ 1 
+(1 row)
+CREATE TABLE
+ f 
+---
+ 2 
+(1 row)
+CREATE TABLE
+ 3 
+---
+ 3 
+(1 row)
+ERROR:  Catalog Error: Table with name "tbl1" already exists!
+CREATE TABLE
+ 4 
+---
+ 4 
+(1 row)
+CREATE TABLE
+ 'hello' 
+---------
+ hello   
+ world   
+(2 rows)
+CREATE TABLE
+ 5 
+---
+(0 rows)
+ERROR:  Parser Error: syntax error at or near "IF"
+ERROR:  Parser Error: syntax error at or near "IF"
+CREATE TABLE
+ col1 | col2  
+------+-------
+ 1    | hello 
+(1 row)
+CREATE TABLE
+ col1 | col2 
+------+------
+ 2    | duck 
+(1 row)
+CREATE TABLE
+ col1 | col2     
+------+----------
+ 3    | database 
+(1 row)
+CREATE TABLE
+ col1 | col need ' quote 
+------+------------------
+ 3.5  | quote            
+(1 row)
+CREATE TABLE
+ col1 | 'mismatch' 
+------+------------
+ 4    | mismatch   
+(1 row)
+ERROR:  Binder Error: Target table has more colum names than query result.
+CREATE TABLE
+ count 
+-------
+ 0     
+(1 row)
+CREATE TABLE
+ count 
+-------
+ 1     
+(1 row)

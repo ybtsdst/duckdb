@@ -1,0 +1,12 @@
+# pg_regress schedule for DuckDB create tests
+# SQL is run verbatim via a PG-protocol-compatible DuckDB interface
+# Source: test/sql/create/
+
+test: create_as
+test: create_database
+test: create_index_on_issue_13643
+test: create_or_replace
+test: create_table_as_duplicate_names
+test: create_table_as_error
+test: create_table_with_arraybounds
+test: create_using_index

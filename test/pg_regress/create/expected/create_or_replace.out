@@ -1,0 +1,7 @@
+CREATE TABLE
+CREATE TABLE
+CREATE VIEW
+ERROR:  Catalog Error: Existing object integers2 is of type View, trying to replace with type Table
+CREATE TABLE
+INSERT 0 1
+ERROR:  Parser Error: Cannot combine OR REPLACE with IF NOT EXISTS
