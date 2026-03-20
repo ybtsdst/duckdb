@@ -1,0 +1,67 @@
+CREATE TABLE
+INSERT 0 1
+INSERT 0 1
+ a | b 
+---+---
+   | 3 
+   |   
+(2 rows)
+DROP TABLE
+CREATE TABLE
+ERROR:  Constraint Error: NOT NULL constraint violated for column "a"
+DROP TABLE
+CREATE TABLE
+INSERT 0 1
+ a | b 
+---+---
+ 1 | 3 
+(1 row)
+DROP TABLE
+CREATE TABLE
+INSERT 0 1
+ a | b 
+---+---
+ 2 | 3 
+(1 row)
+DROP TABLE
+CREATE TABLE
+INSERT 0 1
+ a | b 
+---+---
+ 2 | 3 
+(1 row)
+DROP TABLE
+CREATE SEQUENCE
+CREATE TABLE
+INSERT 0 5
+ a | b 
+---+---
+ 1 | 2 
+ 2 | 4 
+ 3 | 6 
+ 4 | 2 
+ 5 | 4 
+(5 rows)
+ERROR:  Catalog Error: Could not drop sequence "seq" because table "test" depends on it
+DROP TABLE
+DROP SEQUENCE
+CREATE SEQUENCE
+CREATE TABLE
+INSERT 0 1
+UPDATE 1
+ a | b 
+---+---
+ 2 | 1 
+(1 row)
+ERROR:  Binder Error: Default values cannot contain subqueries
+ERROR:  Binder Error: Aggregate functions are not supported in default values
+ERROR:  Binder Error: Window functions are not supported in default values
+ERROR:  Binder Error: Default expression refers to column "b" which is not yet defined
+DROP TABLE
+CREATE TABLE
+INSERT 0 1
+INSERT 0 1
+ count 
+-------
+ 2     
+(1 row)

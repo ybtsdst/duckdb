@@ -1,0 +1,20 @@
+CREATE TABLE
+INSERT 0 1
+ i | j 
+---+---
+ 1 | 2 
+(1 row)
+ i 
+---
+ 1 
+(1 row)
+ j 
+---
+ 2 
+(1 row)
+ERROR:  Parser Error
+DROP TABLE
+CREATE TABLE
+INSERT 0 1
+ERROR:  Constraint Error: Duplicate key "i: 1" violates primary key constraint for table "x"
+INSERT 0 0

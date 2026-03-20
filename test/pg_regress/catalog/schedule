@@ -1,0 +1,11 @@
+# pg_regress schedule for DuckDB catalog/table tests
+# SQL is run verbatim via a PG-protocol-compatible DuckDB interface
+# Source: test/sql/catalog/table/
+
+test: create_table_as_abort
+test: create_table_parameters
+test: long_identifier
+test: test_create_table_parallelism
+test: test_default
+test: test_default_values
+test: test_many_columns

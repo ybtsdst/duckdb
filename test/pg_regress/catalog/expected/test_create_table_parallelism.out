@@ -1,0 +1,11 @@
+CREATE TABLE
+CREATE TABLE
+ count 
+-------
+ 50000 
+(1 row)
+CREATE TABLE
+ count 
+-------
+ 10000 
+(1 row)
