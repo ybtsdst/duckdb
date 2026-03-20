@@ -1,0 +1,12 @@
+CREATE TABLE
+ column_type               
+---------------------------
+ ENUM('hide', 'visible')[] 
+(1 row)
+ATTACH
+CREATE SCHEMA
+CREATE SCHEMA
+CREATE TYPE
+CREATE TYPE
+ERROR:  Parser Error: syntax error at or near "["
+ERROR:  Parser Error: syntax error at or near "["
