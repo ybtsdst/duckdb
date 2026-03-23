@@ -52,6 +52,7 @@ projects/*
 #==============================================================================#
 # Autotools artifacts
 #==============================================================================#
+config/
 configure
 config-h.in
 autom4te.cache
@@ -265,8 +266,16 @@ venv/
 
 # Visual Studio
 .vs
-settings.json
-.vscode
+.vscode/settings.json
+.vscode/*
+!.vscode/tasks.json
+!.vscode/launch.json
+!.vscode/extensions.json
+!.vscode/*.code-snippets
+!*.code-workspace
+
+# Built Visual Studio Code Extensions
+*.vsix
 
 # QtCreator files
 *.user
