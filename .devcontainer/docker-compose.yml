@@ -1,0 +1,27 @@
+services:
+  duckdb_dev_service:
+    build:
+      context: .
+      network: host
+      dockerfile: Dockerfile
+      args:
+        - HTTP_PROXY
+        - DEV_USERNAME
+        - USER_UID
+        - USER_GID
+    env_file:
+      - .env
+    container_name: duckdb_dev
+    privileged: true
+    cap_add:
+      - SYS_PTRACE
+    security_opt:
+      - seccomp=unconfined
+    volumes:
+      - ..:/opt/transwarp/duckdb:cached
+      - /var/run/docker.sock:/var/run/docker.sock
+      - ${LOCAL_CCACHE}:/opt/ccache:cached
+    working_dir: /opt/transwarp/duckdb
+    network_mode: host 
+    tty: true
+    stdin_open: true
