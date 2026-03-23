@@ -1,0 +1,114 @@
+{
+  // See https://go.microsoft.com/fwlink/?LinkId=733558
+  // for the documentation about the tasks.json format
+  "version": "2.0.0",
+  "tasks": [
+    {
+      "label": "build",
+      "type": "shell",
+      "command": "make",
+      "args": [
+        "debug",
+      ],
+      "options": {
+        "env": {
+          "CMAKE_BUILD_PARALLEL_LEVEL": "${env:BUILD_PROC}",
+          "GEN": "ninja",
+          "DUCKDB_PLATFORM": "linux_amd64",
+          "CMAKE_VARS": "-DCMAKE_INSTALL_PREFIX=/opt/transwarp/duckdb_debug",
+          "SKIP_EXTENSIONS": "jemalloc",
+          "DISABLE_SANITIZER" : "1"
+        }
+      },
+      "group": {
+        "kind": "build",
+        "isDefault": true
+      },
+      "problemMatcher": []
+    },
+    {
+      "label": "build (reldebug)",
+      "type": "shell",
+      "command": "make",
+      "args": [
+        "reldebug",
+      ],
+      "options": {
+        "env": {
+          "CMAKE_BUILD_PARALLEL_LEVEL": "${env:BUILD_PROC}",
+          "GEN": "ninja",
+          "DUCKDB_PLATFORM": "linux_amd64",
+          "CMAKE_VARS": "-DCMAKE_INSTALL_PREFIX=/opt/transwarp/duckdb_reldebug -DCMAKE_CXX_FLAGS=\"-fno-omit-frame-pointer\"",
+          "SKIP_EXTENSIONS": "jemalloc",
+          "DUCKDB_EXPLICIT_VERSION": "v1.4.3"
+        }
+      },
+      "group": {
+        "kind": "build",
+      },
+      "problemMatcher": []
+    },{
+      "label": "build (Release)",
+      "type": "shell",
+      "command": "make",
+      "args": [
+        "all",
+      ],
+      "options": {
+        "env": {
+          "CMAKE_BUILD_PARALLEL_LEVEL": "${env:BUILD_PROC}",
+          "GEN": "ninja",
+          "DUCKDB_PLATFORM": "linux_amd64",
+          "CMAKE_VARS": "-DCMAKE_INSTALL_PREFIX=/opt/transwarp/duckdb_release"
+        }
+      },
+      "group": {
+        "kind": "build",
+      },
+      "problemMatcher": []
+    },
+    {
+      "label": "clean",
+      "type": "shell",
+      "command": "make",
+      "args": [
+        "clean"
+      ],
+      "problemMatcher": []
+    },
+    {
+      "label": "install (Release)",
+      "type": "shell",
+      "command": "cmake",
+      "args": [
+        "--build",
+        ".",
+        "--config",
+        "Release",
+        "--target",
+        "install"
+      ],
+      "options": {
+        "cwd": "${workspaceFolder}/build/release"
+      },
+      "problemMatcher": []
+    },
+    {
+      "label": "install",
+      "type": "shell",
+      "command": "cmake",
+      "args": [
+        "--build",
+        ".",
+        "--config",
+        "Debug",
+        "--target",
+        "install"
+      ],
+      "options": {
+        "cwd": "${workspaceFolder}/build/debug"
+      },
+      "problemMatcher": []
+    },
+  ]
+}
