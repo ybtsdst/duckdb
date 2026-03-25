@@ -1,0 +1,598 @@
+ CAST('infinity' AS TIMESTAMP) | CAST('-infinity' AS TIMESTAMP) 
+-------------------------------+--------------------------------
+ infinity                      | -infinity                      
+(1 row)
+
+ CAST('Infinity' AS TIMESTAMP) | CAST('-Infinity' AS TIMESTAMP) 
+-------------------------------+--------------------------------
+ infinity                      | -infinity                      
+(1 row)
+
+ CAST('INFINITY' AS TIMESTAMP) | CAST('-INFINITY' AS TIMESTAMP) 
+-------------------------------+--------------------------------
+ infinity                      | -infinity                      
+(1 row)
+
+ CAST('inFinIty' AS TIMESTAMP) | CAST('-inFinIty' AS TIMESTAMP) 
+-------------------------------+--------------------------------
+ infinity                      | -infinity                      
+(1 row)
+
+ CAST('inf' AS TIMESTAMP) | CAST('-inf' AS TIMESTAMP) 
+--------------------------+---------------------------
+ infinity                 | -infinity                 
+(1 row)
+
+ CAST('infinity' AS TIMESTAMP WITH TIME ZONE) | CAST('-infinity' AS TIMESTAMP WITH TIME ZONE) 
+----------------------------------------------+-----------------------------------------------
+ infinity                                     | -infinity                                     
+(1 row)
+
+ CAST('Infinity' AS TIMESTAMP WITH TIME ZONE) | CAST('-Infinity' AS TIMESTAMP WITH TIME ZONE) 
+----------------------------------------------+-----------------------------------------------
+ infinity                                     | -infinity                                     
+(1 row)
+
+ CAST('INFINITY' AS TIMESTAMP WITH TIME ZONE) | CAST('-INFINITY' AS TIMESTAMP WITH TIME ZONE) 
+----------------------------------------------+-----------------------------------------------
+ infinity                                     | -infinity                                     
+(1 row)
+
+ CAST('inFinIty' AS TIMESTAMP WITH TIME ZONE) | CAST('-inFinIty' AS TIMESTAMP WITH TIME ZONE) 
+----------------------------------------------+-----------------------------------------------
+ infinity                                     | -infinity                                     
+(1 row)
+
+ CAST('inf' AS TIMESTAMP WITH TIME ZONE) | CAST('-inf' AS TIMESTAMP WITH TIME ZONE) 
+-----------------------------------------+------------------------------------------
+ infinity                                | -infinity                                
+(1 row)
+
+ CAST('infinity' AS DATE) | CAST('-infinity' AS DATE) 
+--------------------------+---------------------------
+ infinity                 | -infinity                 
+(1 row)
+
+ CAST('Infinity' AS DATE) | CAST('-Infinity' AS DATE) 
+--------------------------+---------------------------
+ infinity                 | -infinity                 
+(1 row)
+
+ CAST('INFINITY' AS DATE) | CAST('-INFINITY' AS DATE) 
+--------------------------+---------------------------
+ infinity                 | -infinity                 
+(1 row)
+
+ CAST('inFinIty' AS DATE) | CAST('-inFinIty' AS DATE) 
+--------------------------+---------------------------
+ infinity                 | -infinity                 
+(1 row)
+
+ CAST('inf' AS DATE) | CAST('-inf' AS DATE) 
+---------------------+----------------------
+ infinity            | -infinity            
+(1 row)
+
+ERROR:  Conversion Error: invalid timestamp field format: "infinity 00:00:00", expected format is (YYYY-MM-DD HH:MM:SS[.US][±HH:MM| ZONE])
+
+ERROR:  Conversion Error: invalid timestamp field format: "-infinity 00:00:00", expected format is (YYYY-MM-DD HH:MM:SS[.US][±HH:MM| ZONE])
+
+ERROR:  Conversion Error: invalid timestamp field format: "epoch 00:00:00", expected format is (YYYY-MM-DD HH:MM:SS[.US][±HH:MM| ZONE])
+
+ERROR:  Conversion Error: invalid timestamp field format: "infinity 00:00:00", expected format is (YYYY-MM-DD HH:MM:SS[.US][±HH:MM| ZONE])
+
+ERROR:  Conversion Error: invalid timestamp field format: "-infinity 00:00:00", expected format is (YYYY-MM-DD HH:MM:SS[.US][±HH:MM| ZONE])
+
+ERROR:  Conversion Error: invalid timestamp field format: "epoch 00:00:00", expected format is (YYYY-MM-DD HH:MM:SS[.US][±HH:MM| ZONE])
+
+ERROR:  Conversion Error: invalid date field format: "infinity 00:00:00", expected format is (YYYY-MM-DD)
+
+ERROR:  Conversion Error: invalid date field format: "-infinity 00:00:00", expected format is (YYYY-MM-DD)
+
+ERROR:  Conversion Error: invalid date field format: "epoch 00:00:00", expected format is (YYYY-MM-DD)
+
+CREATE TABLE
+
+INSERT 0 3
+
+ ts                  | tstz                   | dt         
+---------------------+------------------------+------------
+ infinity            | infinity               | infinity   
+ -infinity           | -infinity              | -infinity  
+ 1970-01-01 00:00:00 | 1970-01-01 00:00:00+00 | 1970-01-01 
+(3 rows)
+
+CREATE TABLE
+
+INSERT 0 2
+
+ ts        | tstz      | dt        
+-----------+-----------+-----------
+ infinity  | infinity  | infinity  
+ -infinity | -infinity | -infinity 
+(2 rows)
+
+ ts                  | ts                  | (lhs.ts < rhs.ts) | (lhs.ts <= rhs.ts) | (lhs.ts = rhs.ts) | (lhs.ts != rhs.ts) | (lhs.ts >= rhs.ts) | (lhs.ts > rhs.ts) 
+---------------------+---------------------+-------------------+--------------------+-------------------+--------------------+--------------------+-------------------
+ -infinity           | -infinity           | false             | true               | true              | false              | true               | false             
+ -infinity           | 1970-01-01 00:00:00 | true              | true               | false             | true               | false              | false             
+ -infinity           | infinity            | true              | true               | false             | true               | false              | false             
+ 1970-01-01 00:00:00 | -infinity           | false             | false              | false             | true               | true               | true              
+ 1970-01-01 00:00:00 | 1970-01-01 00:00:00 | false             | true               | true              | false              | true               | false             
+ 1970-01-01 00:00:00 | infinity            | true              | true               | false             | true               | false              | false             
+ infinity            | -infinity           | false             | false              | false             | true               | true               | true              
+ infinity            | 1970-01-01 00:00:00 | false             | false              | false             | true               | true               | true              
+ infinity            | infinity            | false             | true               | true              | false              | true               | false             
+(9 rows)
+
+ tstz                   | tstz                   | (lhs.tstz < rhs.tstz) | (lhs.tstz <= rhs.tstz) | (lhs.tstz = rhs.tstz) | (lhs.tstz != rhs.tstz) | (lhs.tstz >= rhs.tstz) | (lhs.tstz > rhs.tstz) 
+------------------------+------------------------+-----------------------+------------------------+-----------------------+------------------------+------------------------+-----------------------
+ -infinity              | -infinity              | false                 | true                   | true                  | false                  | true                   | false                 
+ -infinity              | 1970-01-01 00:00:00+00 | true                  | true                   | false                 | true                   | false                  | false                 
+ -infinity              | infinity               | true                  | true                   | false                 | true                   | false                  | false                 
+ 1970-01-01 00:00:00+00 | -infinity              | false                 | false                  | false                 | true                   | true                   | true                  
+ 1970-01-01 00:00:00+00 | 1970-01-01 00:00:00+00 | false                 | true                   | true                  | false                  | true                   | false                 
+ 1970-01-01 00:00:00+00 | infinity               | true                  | true                   | false                 | true                   | false                  | false                 
+ infinity               | -infinity              | false                 | false                  | false                 | true                   | true                   | true                  
+ infinity               | 1970-01-01 00:00:00+00 | false                 | false                  | false                 | true                   | true                   | true                  
+ infinity               | infinity               | false                 | true                   | true                  | false                  | true                   | false                 
+(9 rows)
+
+ dt         | dt         | (lhs.dt < rhs.dt) | (lhs.dt <= rhs.dt) | (lhs.dt = rhs.dt) | (lhs.dt != rhs.dt) | (lhs.dt >= rhs.dt) | (lhs.dt > rhs.dt) 
+------------+------------+-------------------+--------------------+-------------------+--------------------+--------------------+-------------------
+ -infinity  | -infinity  | false             | true               | true              | false              | true               | false             
+ -infinity  | 1970-01-01 | true              | true               | false             | true               | false              | false             
+ -infinity  | infinity   | true              | true               | false             | true               | false              | false             
+ 1970-01-01 | -infinity  | false             | false              | false             | true               | true               | true              
+ 1970-01-01 | 1970-01-01 | false             | true               | true              | false              | true               | false             
+ 1970-01-01 | infinity   | true              | true               | false             | true               | false              | false             
+ infinity   | -infinity  | false             | false              | false             | true               | true               | true              
+ infinity   | 1970-01-01 | false             | false              | false             | true               | true               | true              
+ infinity   | infinity   | false             | true               | true              | false              | true               | false             
+(9 rows)
+
+ min(ts)   | max(ts)  | min(tstz) | max(tstz) | min(dt)   | max(dt)  
+-----------+----------+-----------+-----------+-----------+----------
+ -infinity | infinity | -infinity | infinity  | -infinity | infinity 
+(1 row)
+
+ median(ts)          | median(tstz)           | median(dt)          
+---------------------+------------------------+---------------------
+ 1970-01-01 00:00:00 | 1970-01-01 00:00:00+00 | 1970-01-01 00:00:00 
+(1 row)
+
+ "mode"(ts) | "mode"(tstz) | "mode"(dt) 
+------------+--------------+------------
+ infinity   | infinity     | infinity   
+(1 row)
+
+ approx_count_distinct(ts) | approx_count_distinct(tstz) | approx_count_distinct(dt) 
+---------------------------+-----------------------------+---------------------------
+ 3                         | 3                           | 3                         
+(1 row)
+
+ arbitrary(ts) | "first"(ts) | "last"(ts)          
+---------------+-------------+---------------------
+ infinity      | infinity    | 1970-01-01 00:00:00 
+(1 row)
+
+ arbitrary(tstz) | "first"(tstz) | "last"(tstz)           
+-----------------+---------------+------------------------
+ infinity        | infinity      | 1970-01-01 00:00:00+00 
+(1 row)
+
+ arbitrary(dt) | "first"(dt) | "last"(dt) 
+---------------+-------------+------------
+ infinity      | infinity    | 1970-01-01 
+(1 row)
+
+ arg_min(ts, ts) | arg_max(ts, ts) 
+-----------------+-----------------
+ -infinity       | infinity        
+(1 row)
+
+ arg_min(ts, tstz) | arg_max(ts, tstz) 
+-------------------+-------------------
+ -infinity         | infinity          
+(1 row)
+
+ arg_min(ts, dt) | arg_max(ts, dt) 
+-----------------+-----------------
+ -infinity       | infinity        
+(1 row)
+
+ arg_min(tstz, ts) | arg_max(tstz, ts) 
+-------------------+-------------------
+ -infinity         | infinity          
+(1 row)
+
+ arg_min(tstz, tstz) | arg_max(tstz, tstz) 
+---------------------+---------------------
+ -infinity           | infinity            
+(1 row)
+
+ arg_min(tstz, dt) | arg_max(tstz, dt) 
+-------------------+-------------------
+ -infinity         | infinity          
+(1 row)
+
+ arg_min(dt, ts) | arg_max(dt, ts) 
+-----------------+-----------------
+ -infinity       | infinity        
+(1 row)
+
+ arg_min(dt, tstz) | arg_max(dt, tstz) 
+-------------------+-------------------
+ -infinity         | infinity          
+(1 row)
+
+ arg_min(dt, dt) | arg_max(dt, dt) 
+-----------------+-----------------
+ -infinity       | infinity        
+(1 row)
+
+ histogram(ts)                                      | histogram(tstz)                                       | histogram(dt)                           
+----------------------------------------------------+-------------------------------------------------------+-----------------------------------------
+ {-infinity=1, '1970-01-01 00:00:00'=1, infinity=1} | {-infinity=1, '1970-01-01 00:00:00+00'=1, infinity=1} | {-infinity=1, 1970-01-01=1, infinity=1} 
+(1 row)
+
+ quantile_disc(ts, 0.32) | quantile_disc(tstz, 0.32) | quantile_disc(dt, 0.32) 
+-------------------------+---------------------------+-------------------------
+ -infinity               | -infinity                 | -infinity               
+(1 row)
+
+ quantile_disc(ts, main.list_value(0.0, 0.5, 1.0)) | quantile_disc(tstz, main.list_value(0.0, 0.5, 1.0)) | quantile_disc(dt, main.list_value(0.0, 0.5, 1.0)) 
+---------------------------------------------------+-----------------------------------------------------+---------------------------------------------------
+ [-infinity, '1970-01-01 00:00:00', infinity]      | [-infinity, '1970-01-01 00:00:00+00', infinity]     | [-infinity, 1970-01-01, infinity]                 
+(1 row)
+
+ quantile_cont(ts, 0.25)           | quantile_cont(tstz, 0.25)            | quantile_cont(dt, 0.25)           
+-----------------------------------+--------------------------------------+-----------------------------------
+ 144170-06-28 (BC) 09:59:32.612096 | 144170-06-28 (BC) 09:59:32.612096+00 | 144170-06-28 (BC) 09:59:32.612096 
+(1 row)
+
+ quantile_cont(ts, main.list_value(0.25, 0.5, 0.75))                                          | quantile_cont(tstz, main.list_value(0.25, 0.5, 0.75))                                                 | quantile_cont(dt, main.list_value(0.25, 0.5, 0.75))                                          
+----------------------------------------------------------------------------------------------+-------------------------------------------------------------------------------------------------------+----------------------------------------------------------------------------------------------
+ ['144170-06-28 (BC) 09:59:32.612096', '1970-01-01 00:00:00', '148108-07-06 14:00:27.387904'] | ['144170-06-28 (BC) 09:59:32.612096+00', '1970-01-01 00:00:00+00', '148108-07-06 14:00:27.387904+00'] | ['144170-06-28 (BC) 09:59:32.612096', '1970-01-01 00:00:00', '148108-07-06 14:00:27.387904'] 
+(1 row)
+
+ mad(ts)                        | mad(tstz)                      | mad(dt)                        
+--------------------------------+--------------------------------+--------------------------------
+ 106751991 days 04:00:54.775807 | 106751991 days 04:00:54.775807 | 106751991 days 04:00:54.775807 
+(1 row)
+
+ entropy(ts) | entropy(tstz) | entropy(dt) 
+-------------+---------------+-------------
+ 1.584963    | 1.584963      | 1.584963    
+(1 row)
+
+ (CAST('infinity' AS TIMESTAMP) + to_microseconds(CAST(trunc(CAST(1 AS DOUBLE)) AS BIGINT))) 
+---------------------------------------------------------------------------------------------
+ infinity                                                                                    
+(1 row)
+
+ (CAST('-infinity' AS TIMESTAMP) + to_microseconds(CAST(trunc(CAST(1 AS DOUBLE)) AS BIGINT))) 
+----------------------------------------------------------------------------------------------
+ -infinity                                                                                    
+(1 row)
+
+ (CAST('infinity' AS TIMESTAMP) - to_microseconds(CAST(trunc(CAST(1 AS DOUBLE)) AS BIGINT))) 
+---------------------------------------------------------------------------------------------
+ infinity                                                                                    
+(1 row)
+
+ (CAST('-infinity' AS TIMESTAMP) - to_microseconds(CAST(trunc(CAST(1 AS DOUBLE)) AS BIGINT))) 
+----------------------------------------------------------------------------------------------
+ -infinity                                                                                    
+(1 row)
+
+ (CAST('infinity' AS TIMESTAMP) + to_seconds(CAST(1 AS DOUBLE))) 
+-----------------------------------------------------------------
+ infinity                                                        
+(1 row)
+
+ (CAST('-infinity' AS TIMESTAMP) + to_seconds(CAST(1 AS DOUBLE))) 
+------------------------------------------------------------------
+ -infinity                                                        
+(1 row)
+
+ (CAST('infinity' AS TIMESTAMP) - to_seconds(CAST(1 AS DOUBLE))) 
+-----------------------------------------------------------------
+ infinity                                                        
+(1 row)
+
+ (CAST('-infinity' AS TIMESTAMP) - to_seconds(CAST(1 AS DOUBLE))) 
+------------------------------------------------------------------
+ -infinity                                                        
+(1 row)
+
+ (CAST('infinity' AS TIMESTAMP) + to_minutes(CAST(trunc(CAST(1 AS DOUBLE)) AS BIGINT))) 
+----------------------------------------------------------------------------------------
+ infinity                                                                               
+(1 row)
+
+ (CAST('-infinity' AS TIMESTAMP) + to_minutes(CAST(trunc(CAST(1 AS DOUBLE)) AS BIGINT))) 
+-----------------------------------------------------------------------------------------
+ -infinity                                                                               
+(1 row)
+
+ (CAST('infinity' AS TIMESTAMP) - to_minutes(CAST(trunc(CAST(1 AS DOUBLE)) AS BIGINT))) 
+----------------------------------------------------------------------------------------
+ infinity                                                                               
+(1 row)
+
+ (CAST('-infinity' AS TIMESTAMP) - to_minutes(CAST(trunc(CAST(1 AS DOUBLE)) AS BIGINT))) 
+-----------------------------------------------------------------------------------------
+ -infinity                                                                               
+(1 row)
+
+ (CAST('infinity' AS TIMESTAMP) + to_hours(CAST(trunc(CAST(1 AS DOUBLE)) AS BIGINT))) 
+--------------------------------------------------------------------------------------
+ infinity                                                                             
+(1 row)
+
+ (CAST('-infinity' AS TIMESTAMP) + to_hours(CAST(trunc(CAST(1 AS DOUBLE)) AS BIGINT))) 
+---------------------------------------------------------------------------------------
+ -infinity                                                                             
+(1 row)
+
+ (CAST('infinity' AS TIMESTAMP) - to_hours(CAST(trunc(CAST(1 AS DOUBLE)) AS BIGINT))) 
+--------------------------------------------------------------------------------------
+ infinity                                                                             
+(1 row)
+
+ (CAST('-infinity' AS TIMESTAMP) - to_hours(CAST(trunc(CAST(1 AS DOUBLE)) AS BIGINT))) 
+---------------------------------------------------------------------------------------
+ -infinity                                                                             
+(1 row)
+
+ (CAST('infinity' AS TIMESTAMP) + to_days(CAST(trunc(CAST(1 AS DOUBLE)) AS INTEGER))) 
+--------------------------------------------------------------------------------------
+ infinity                                                                             
+(1 row)
+
+ (CAST('-infinity' AS TIMESTAMP) + to_days(CAST(trunc(CAST(1 AS DOUBLE)) AS INTEGER))) 
+---------------------------------------------------------------------------------------
+ -infinity                                                                             
+(1 row)
+
+ (CAST('infinity' AS TIMESTAMP) - to_days(CAST(trunc(CAST(1 AS DOUBLE)) AS INTEGER))) 
+--------------------------------------------------------------------------------------
+ infinity                                                                             
+(1 row)
+
+ (CAST('-infinity' AS TIMESTAMP) - to_days(CAST(trunc(CAST(1 AS DOUBLE)) AS INTEGER))) 
+---------------------------------------------------------------------------------------
+ -infinity                                                                             
+(1 row)
+
+ (CAST('infinity' AS TIMESTAMP) + to_months(CAST(trunc(CAST(1 AS DOUBLE)) AS INTEGER))) 
+----------------------------------------------------------------------------------------
+ infinity                                                                               
+(1 row)
+
+ (CAST('-infinity' AS TIMESTAMP) + to_months(CAST(trunc(CAST(1 AS DOUBLE)) AS INTEGER))) 
+-----------------------------------------------------------------------------------------
+ -infinity                                                                               
+(1 row)
+
+ (CAST('infinity' AS TIMESTAMP) - to_months(CAST(trunc(CAST(1 AS DOUBLE)) AS INTEGER))) 
+----------------------------------------------------------------------------------------
+ infinity                                                                               
+(1 row)
+
+ (CAST('-infinity' AS TIMESTAMP) - to_months(CAST(trunc(CAST(1 AS DOUBLE)) AS INTEGER))) 
+-----------------------------------------------------------------------------------------
+ -infinity                                                                               
+(1 row)
+
+ (CAST('infinity' AS TIMESTAMP) + to_years(CAST(trunc(CAST(1 AS DOUBLE)) AS INTEGER))) 
+---------------------------------------------------------------------------------------
+ infinity                                                                              
+(1 row)
+
+ (CAST('-infinity' AS TIMESTAMP) + to_years(CAST(trunc(CAST(1 AS DOUBLE)) AS INTEGER))) 
+----------------------------------------------------------------------------------------
+ -infinity                                                                              
+(1 row)
+
+ (CAST('infinity' AS TIMESTAMP) - to_years(CAST(trunc(CAST(1 AS DOUBLE)) AS INTEGER))) 
+---------------------------------------------------------------------------------------
+ infinity                                                                              
+(1 row)
+
+ (CAST('-infinity' AS TIMESTAMP) - to_years(CAST(trunc(CAST(1 AS DOUBLE)) AS INTEGER))) 
+----------------------------------------------------------------------------------------
+ -infinity                                                                              
+(1 row)
+
+ (CAST('infinity' AS DATE) + to_microseconds(CAST(trunc(CAST(1 AS DOUBLE)) AS BIGINT))) 
+----------------------------------------------------------------------------------------
+ infinity                                                                               
+(1 row)
+
+ (CAST('-infinity' AS DATE) + to_microseconds(CAST(trunc(CAST(1 AS DOUBLE)) AS BIGINT))) 
+-----------------------------------------------------------------------------------------
+ -infinity                                                                               
+(1 row)
+
+ (CAST('infinity' AS DATE) - to_microseconds(CAST(trunc(CAST(1 AS DOUBLE)) AS BIGINT))) 
+----------------------------------------------------------------------------------------
+ infinity                                                                               
+(1 row)
+
+ (CAST('-infinity' AS DATE) - to_microseconds(CAST(trunc(CAST(1 AS DOUBLE)) AS BIGINT))) 
+-----------------------------------------------------------------------------------------
+ -infinity                                                                               
+(1 row)
+
+ (CAST('infinity' AS DATE) + to_seconds(CAST(1 AS DOUBLE))) 
+------------------------------------------------------------
+ infinity                                                   
+(1 row)
+
+ (CAST('-infinity' AS DATE) + to_seconds(CAST(1 AS DOUBLE))) 
+-------------------------------------------------------------
+ -infinity                                                   
+(1 row)
+
+ (CAST('infinity' AS DATE) - to_seconds(CAST(1 AS DOUBLE))) 
+------------------------------------------------------------
+ infinity                                                   
+(1 row)
+
+ (CAST('-infinity' AS DATE) - to_seconds(CAST(1 AS DOUBLE))) 
+-------------------------------------------------------------
+ -infinity                                                   
+(1 row)
+
+ (CAST('infinity' AS DATE) + to_minutes(CAST(trunc(CAST(1 AS DOUBLE)) AS BIGINT))) 
+-----------------------------------------------------------------------------------
+ infinity                                                                          
+(1 row)
+
+ (CAST('-infinity' AS DATE) + to_minutes(CAST(trunc(CAST(1 AS DOUBLE)) AS BIGINT))) 
+------------------------------------------------------------------------------------
+ -infinity                                                                          
+(1 row)
+
+ (CAST('infinity' AS DATE) - to_minutes(CAST(trunc(CAST(1 AS DOUBLE)) AS BIGINT))) 
+-----------------------------------------------------------------------------------
+ infinity                                                                          
+(1 row)
+
+ (CAST('-infinity' AS DATE) - to_minutes(CAST(trunc(CAST(1 AS DOUBLE)) AS BIGINT))) 
+------------------------------------------------------------------------------------
+ -infinity                                                                          
+(1 row)
+
+ (CAST('infinity' AS DATE) + to_hours(CAST(trunc(CAST(1 AS DOUBLE)) AS BIGINT))) 
+---------------------------------------------------------------------------------
+ infinity                                                                        
+(1 row)
+
+ (CAST('-infinity' AS DATE) + to_hours(CAST(trunc(CAST(1 AS DOUBLE)) AS BIGINT))) 
+----------------------------------------------------------------------------------
+ -infinity                                                                        
+(1 row)
+
+ (CAST('infinity' AS DATE) - to_hours(CAST(trunc(CAST(1 AS DOUBLE)) AS BIGINT))) 
+---------------------------------------------------------------------------------
+ infinity                                                                        
+(1 row)
+
+ (CAST('-infinity' AS DATE) - to_hours(CAST(trunc(CAST(1 AS DOUBLE)) AS BIGINT))) 
+----------------------------------------------------------------------------------
+ -infinity                                                                        
+(1 row)
+
+ (CAST('infinity' AS DATE) + to_days(CAST(trunc(CAST(1 AS DOUBLE)) AS INTEGER))) 
+---------------------------------------------------------------------------------
+ infinity                                                                        
+(1 row)
+
+ (CAST('-infinity' AS DATE) + to_days(CAST(trunc(CAST(1 AS DOUBLE)) AS INTEGER))) 
+----------------------------------------------------------------------------------
+ -infinity                                                                        
+(1 row)
+
+ (CAST('infinity' AS DATE) - to_days(CAST(trunc(CAST(1 AS DOUBLE)) AS INTEGER))) 
+---------------------------------------------------------------------------------
+ infinity                                                                        
+(1 row)
+
+ (CAST('-infinity' AS DATE) - to_days(CAST(trunc(CAST(1 AS DOUBLE)) AS INTEGER))) 
+----------------------------------------------------------------------------------
+ -infinity                                                                        
+(1 row)
+
+ (CAST('infinity' AS DATE) + to_months(CAST(trunc(CAST(1 AS DOUBLE)) AS INTEGER))) 
+-----------------------------------------------------------------------------------
+ infinity                                                                          
+(1 row)
+
+ (CAST('-infinity' AS DATE) + to_months(CAST(trunc(CAST(1 AS DOUBLE)) AS INTEGER))) 
+------------------------------------------------------------------------------------
+ -infinity                                                                          
+(1 row)
+
+ (CAST('infinity' AS DATE) - to_months(CAST(trunc(CAST(1 AS DOUBLE)) AS INTEGER))) 
+-----------------------------------------------------------------------------------
+ infinity                                                                          
+(1 row)
+
+ (CAST('-infinity' AS DATE) - to_months(CAST(trunc(CAST(1 AS DOUBLE)) AS INTEGER))) 
+------------------------------------------------------------------------------------
+ -infinity                                                                          
+(1 row)
+
+ (CAST('infinity' AS DATE) + to_years(CAST(trunc(CAST(1 AS DOUBLE)) AS INTEGER))) 
+----------------------------------------------------------------------------------
+ infinity                                                                         
+(1 row)
+
+ (CAST('-infinity' AS DATE) + to_years(CAST(trunc(CAST(1 AS DOUBLE)) AS INTEGER))) 
+-----------------------------------------------------------------------------------
+ -infinity                                                                         
+(1 row)
+
+ (CAST('infinity' AS DATE) - to_years(CAST(trunc(CAST(1 AS DOUBLE)) AS INTEGER))) 
+----------------------------------------------------------------------------------
+ infinity                                                                         
+(1 row)
+
+ (CAST('-infinity' AS DATE) - to_years(CAST(trunc(CAST(1 AS DOUBLE)) AS INTEGER))) 
+-----------------------------------------------------------------------------------
+ -infinity                                                                         
+(1 row)
+
+ (dt + 1)   | (dt - 1)   
+------------+------------
+ infinity   | infinity   
+ -infinity  | -infinity  
+ 1970-01-02 | 1969-12-31 
+(3 rows)
+
+ (dt + CAST('12:34:56' AS TIME)) 
+---------------------------------
+ infinity                        
+ -infinity                       
+ 1970-01-01 12:34:56             
+(3 rows)
+
+ isfinite(ts) | isfinite(tstz) | isfinite(dt) 
+--------------+----------------+--------------
+ 0            | 0              | 0            
+ 0            | 0              | 0            
+ 1            | 1              | 1            
+(3 rows)
+
+ isinf(ts) | isinf(tstz) | isinf(dt) 
+-----------+-------------+-----------
+ 1         | 1           | 1         
+ 1         | 1           | 1         
+ 0         | 0           | 0         
+(3 rows)
+
+ CAST(ts AS VARCHAR) | CAST(tstz AS VARCHAR)  | CAST(dt AS VARCHAR) 
+---------------------+------------------------+---------------------
+ infinity            | infinity               | infinity            
+ -infinity           | -infinity              | -infinity           
+ 1970-01-01 00:00:00 | 1970-01-01 00:00:00+00 | 1970-01-01          
+(3 rows)
+
+ERROR:  Invalid Input Error: Type INT64 with value infinity can't be cast to the destination type INT64
+
+ERROR:  Conversion Error: time field value out of range: "infinity", expected format is ([YYYY-MM-DD ]HH:MM:SS[.MS])
+
+ERROR:  Invalid Input Error: Cannot subtract infinite timestamps
+
+ERROR:  Invalid Input Error: Cannot subtract infinite timestamps
+
+ERROR:  Conversion Error: invalid timestamp field format: "e", expected format is (YYYY-MM-DD HH:MM:SS[.US][±HH:MM| ZONE])
+
+ERROR:  Conversion Error: invalid date field format: "e", expected format is (YYYY-MM-DD)
+
+ERROR:  Conversion Error: invalid timestamp field format: "i", expected format is (YYYY-MM-DD HH:MM:SS[.US][±HH:MM| ZONE])
+
+ERROR:  Conversion Error: invalid date field format: "i", expected format is (YYYY-MM-DD)

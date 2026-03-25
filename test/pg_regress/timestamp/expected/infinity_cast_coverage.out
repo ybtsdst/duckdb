@@ -1,0 +1,99 @@
+ (CAST(CAST('infinity' AS TIMESTAMP) AS TIMESTAMP WITH TIME ZONE) = 'infinity') 
+--------------------------------------------------------------------------------
+ true                                                                           
+(1 row)
+
+ (CAST(CAST('infinity' AS TIMESTAMP) AS TIMESTAMP) = 'infinity') 
+-----------------------------------------------------------------
+ true                                                            
+(1 row)
+
+ (CAST(CAST('infinity' AS TIMESTAMP_MS) AS TIMESTAMP WITH TIME ZONE) = 'infinity') 
+-----------------------------------------------------------------------------------
+ true                                                                              
+(1 row)
+
+ (CAST(CAST('infinity' AS TIMESTAMP_MS) AS TIMESTAMP) = 'infinity') 
+--------------------------------------------------------------------
+ true                                                               
+(1 row)
+
+ (CAST(CAST('infinity' AS TIMESTAMP_NS) AS TIMESTAMP WITH TIME ZONE) = 'infinity') 
+-----------------------------------------------------------------------------------
+ true                                                                              
+(1 row)
+
+ (CAST(CAST('infinity' AS TIMESTAMP_NS) AS TIMESTAMP) = 'infinity') 
+--------------------------------------------------------------------
+ true                                                               
+(1 row)
+
+ (CAST(CAST('infinity' AS TIMESTAMP_S) AS TIMESTAMP WITH TIME ZONE) = 'infinity') 
+----------------------------------------------------------------------------------
+ true                                                                             
+(1 row)
+
+ (CAST(CAST('infinity' AS TIMESTAMP_S) AS TIMESTAMP) = 'infinity') 
+-------------------------------------------------------------------
+ true                                                              
+(1 row)
+
+ (CAST(CAST('infinity' AS TIMESTAMP WITH TIME ZONE) AS TIMESTAMP WITH TIME ZONE) = 'infinity') 
+-----------------------------------------------------------------------------------------------
+ true                                                                                          
+(1 row)
+
+ (CAST(CAST('infinity' AS TIMESTAMP WITH TIME ZONE) AS TIMESTAMP) = 'infinity') 
+--------------------------------------------------------------------------------
+ true                                                                           
+(1 row)
+
+ (CAST(CAST('-infinity' AS TIMESTAMP) AS TIMESTAMP WITH TIME ZONE) = '-infinity') 
+----------------------------------------------------------------------------------
+ true                                                                             
+(1 row)
+
+ (CAST(CAST('-infinity' AS TIMESTAMP) AS TIMESTAMP) = '-infinity') 
+-------------------------------------------------------------------
+ true                                                              
+(1 row)
+
+ (CAST(CAST('-infinity' AS TIMESTAMP_MS) AS TIMESTAMP WITH TIME ZONE) = '-infinity') 
+-------------------------------------------------------------------------------------
+ true                                                                                
+(1 row)
+
+ (CAST(CAST('-infinity' AS TIMESTAMP_MS) AS TIMESTAMP) = '-infinity') 
+----------------------------------------------------------------------
+ true                                                                 
+(1 row)
+
+ (CAST(CAST('-infinity' AS TIMESTAMP_NS) AS TIMESTAMP WITH TIME ZONE) = '-infinity') 
+-------------------------------------------------------------------------------------
+ true                                                                                
+(1 row)
+
+ (CAST(CAST('-infinity' AS TIMESTAMP_NS) AS TIMESTAMP) = '-infinity') 
+----------------------------------------------------------------------
+ true                                                                 
+(1 row)
+
+ (CAST(CAST('-infinity' AS TIMESTAMP_S) AS TIMESTAMP WITH TIME ZONE) = '-infinity') 
+------------------------------------------------------------------------------------
+ true                                                                               
+(1 row)
+
+ (CAST(CAST('-infinity' AS TIMESTAMP_S) AS TIMESTAMP) = '-infinity') 
+---------------------------------------------------------------------
+ true                                                                
+(1 row)
+
+ (CAST(CAST('-infinity' AS TIMESTAMP WITH TIME ZONE) AS TIMESTAMP WITH TIME ZONE) = '-infinity') 
+-------------------------------------------------------------------------------------------------
+ true                                                                                            
+(1 row)
+
+ (CAST(CAST('-infinity' AS TIMESTAMP WITH TIME ZONE) AS TIMESTAMP) = '-infinity') 
+----------------------------------------------------------------------------------
+ true                                                                             
+(1 row)
