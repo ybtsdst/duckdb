@@ -1,0 +1,29 @@
+CREATE TABLE
+
+ERROR:  Conversion Error: invalid timestamp field format: "blabla", expected format is (YYYY-MM-DD HH:MM:SS[.US][±HH:MM| ZONE])
+
+ERROR:  Conversion Error: timestamp field value out of range: "1993-20-14 00:00:00"
+
+ERROR:  Conversion Error: timestamp field value out of range: "1993-08-99 00:00:00"
+
+ERROR:  Conversion Error: timestamp field value out of range: "1993-02-29 00:00:00"
+
+ERROR:  Conversion Error: timestamp field value out of range: "1900-02-29 00:00:00"
+
+INSERT 0 1
+
+INSERT 0 1
+
+ERROR:  Conversion Error: invalid timestamp field format: "02-02-1992 00:00:00", expected format is (YYYY-MM-DD HH:MM:SS[.US][±HH:MM| ZONE])
+
+ERROR:  Conversion Error: timestamp field value out of range: "1900-1-1 59:59:23"
+
+ERROR:  Conversion Error: invalid timestamp field format: "1900a01a01 00:00:00", expected format is (YYYY-MM-DD HH:MM:SS[.US][±HH:MM| ZONE])
+
+ERROR:  Conversion Error: invalid timestamp field format: "1900-1-1 00;00;00", expected format is (YYYY-MM-DD HH:MM:SS[.US][±HH:MM| ZONE])
+
+ERROR:  Conversion Error: invalid timestamp field format: "1900-1-1 00a00a00", expected format is (YYYY-MM-DD HH:MM:SS[.US][±HH:MM| ZONE])
+
+ERROR:  Conversion Error: invalid timestamp field format: "1900-1-1 00/00/00", expected format is (YYYY-MM-DD HH:MM:SS[.US][±HH:MM| ZONE])
+
+ERROR:  Conversion Error: invalid timestamp field format: "1900-1-1 00-00-00", expected format is (YYYY-MM-DD HH:MM:SS[.US][±HH:MM| ZONE])

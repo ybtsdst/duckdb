@@ -1,0 +1,128 @@
+SET
+
+
+CREATE TABLE
+
+INSERT 0 8
+
+ CAST('2017-07-23 13:10:11' AS TIMESTAMP) 
+------------------------------------------
+ 2017-07-23 13:10:11                      
+(1 row)
+
+ CAST('2017-07-23T13:10:11' AS TIMESTAMP) | CAST('2017-07-23T13:10:11Z' AS TIMESTAMP) 
+------------------------------------------+-------------------------------------------
+ 2017-07-23 13:10:11                      | 2017-07-23 13:10:11                       
+(1 row)
+
+ CAST('    2017-07-23     13:10:11    ' AS TIMESTAMP) 
+------------------------------------------------------
+ 2017-07-23 13:10:11                                  
+(1 row)
+
+ERROR:  Conversion Error: invalid timestamp field format: "    2017-07-23     13:10:11    AA", expected format is (YYYY-MM-DD HH:MM:SS[.US][±HH:MM| ZONE])
+
+ERROR:  Conversion Error: invalid timestamp field format: "AA2017-07-23 13:10:11", expected format is (YYYY-MM-DD HH:MM:SS[.US][±HH:MM| ZONE])
+
+ERROR:  Conversion Error: invalid timestamp field format: "2017-07-23A13:10:11", expected format is (YYYY-MM-DD HH:MM:SS[.US][±HH:MM| ZONE])
+
+ t                   
+---------------------
+                     
+ 2007-01-01 00:00:01 
+ 2008-01-01 00:00:01 
+ 2008-01-01 00:00:10 
+ 2008-01-01 00:10:00 
+ 2008-01-01 10:00:00 
+ 2008-01-02 00:00:01 
+ 2008-02-01 00:00:01 
+(8 rows)
+
+ min(t)              
+---------------------
+ 2007-01-01 00:00:01 
+(1 row)
+
+ max(t)              
+---------------------
+ 2008-02-01 00:00:01 
+(1 row)
+
+ERROR:  Binder Error: No function matches the given name and argument types 'sum(TIMESTAMP)'. You might need to add explicit type casts.
+
+ AVG(t)                     
+----------------------------
+ 2007-11-14 11:44:19.142857 
+(1 row)
+
+ERROR:  Binder Error: No function matches the given name and argument types '+(TIMESTAMP, TIMESTAMP)'. You might need to add explicit type casts.
+
+ERROR:  Binder Error: No function matches the given name and argument types '*(TIMESTAMP, TIMESTAMP)'. You might need to add explicit type casts.
+
+ERROR:  Binder Error: No function matches the given name and argument types '/(TIMESTAMP, TIMESTAMP)'. You might need to add explicit type casts.
+
+ERROR:  Binder Error: No function matches the given name and argument types '%(TIMESTAMP, TIMESTAMP)'. You might need to add explicit type casts.
+
+ (t - t)  
+----------
+ 00:00:00 
+          
+ 00:00:00 
+ 00:00:00 
+ 00:00:00 
+ 00:00:00 
+ 00:00:00 
+ 00:00:00 
+(8 rows)
+
+ "year"(CAST('1992-01-01 01:01:01' AS TIMESTAMP)) 
+--------------------------------------------------
+ 1992                                             
+(1 row)
+
+ "year"(CAST(CAST('1992-01-01 01:01:01' AS TIMESTAMP) AS DATE)) 
+----------------------------------------------------------------
+ 1992                                                           
+(1 row)
+
+ CAST(CAST('1992-01-01 01:01:01' AS TIMESTAMP) AS DATE) 
+--------------------------------------------------------
+ 1992-01-01                                             
+(1 row)
+
+ CAST(CAST('1992-01-01 01:01:01' AS TIMESTAMP) AS TIME) 
+--------------------------------------------------------
+ 01:01:01                                               
+(1 row)
+
+ CAST(t AS DATE) 
+-----------------
+ 2007-01-01      
+(1 row)
+
+ CAST(t AS TIME) 
+-----------------
+ 00:00:01        
+(1 row)
+
+ CAST(CAST('1992-01-01' AS DATE) AS TIMESTAMP) 
+-----------------------------------------------
+ 1992-01-01 00:00:00                           
+(1 row)
+
+ CAST(CAST('2008-01-01 00:00:01.5' AS TIMESTAMP) AS VARCHAR) 
+-------------------------------------------------------------
+ 2008-01-01 00:00:01.5                                       
+(1 row)
+
+ CAST(CAST('-8-01-01 00:00:01.5' AS TIMESTAMP) AS VARCHAR) 
+-----------------------------------------------------------
+ 0009-01-01 (BC) 00:00:01.5                                
+(1 row)
+
+ CAST(CAST('100000-01-01 00:00:01.5' AS TIMESTAMP) AS VARCHAR) 
+---------------------------------------------------------------
+ 100000-01-01 00:00:01.5                                       
+(1 row)
+
+ERROR:  Conversion Error: invalid timestamp field format

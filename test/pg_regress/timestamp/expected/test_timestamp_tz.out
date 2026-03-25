@@ -1,0 +1,18 @@
+ CAST('2021-11-15 02:30:00' AS TIMESTAMP WITH TIME ZONE) 
+---------------------------------------------------------
+ 2021-11-15 02:30:00+00                                  
+(1 row)
+
+ CAST(CAST('2021-11-15 02:30:00' AS TIMESTAMP) AS TIMESTAMP WITH TIME ZONE) 
+----------------------------------------------------------------------------
+ 2021-11-15 02:30:00+00                                                     
+(1 row)
+
+ERROR:  Conversion Error: Unimplemented type for cast (TIMESTAMP WITH TIME ZONE -> DATE)
+
+ERROR:  Conversion Error: Unimplemented type for cast (TIMESTAMP WITH TIME ZONE -> TIME)
+
+ CAST('1880-05-15T12:00:00+00:50:20' AS TIMESTAMP WITH TIME ZONE) 
+------------------------------------------------------------------
+ 1880-05-15 11:09:40+00                                           
+(1 row)
