@@ -1,0 +1,17 @@
+test: alternative_timestamp_casts
+test: bc_timestamp
+test: infinity_cast_coverage
+test: test_incorrect_timestamp
+test: test_infinite_time
+test: test_timestamp
+test: test_timestamp_2411
+test: test_timestamp_auto_casting
+test: test_timestamp_ms
+test: test_timestamp_to_tz_cast
+test: test_timestamp_types
+test: test_timestamp_tz
+test: timestamp_limits
+test: timestamp_precision
+test: timestamp_timezone_cast
+test: timestamp_try_cast
+test: utc_offset

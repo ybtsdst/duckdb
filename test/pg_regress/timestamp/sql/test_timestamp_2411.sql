@@ -1,0 +1,25 @@
+-- Converted from test_timestamp_2411.test
+-- DuckDB timestamp test suite
+-- SQL is kept verbatim; run via PG-protocol-compatible DuckDB interface
+
+-- name: test/sql/types/timestamp/test_timestamp_2411.test
+-- description: Test bug described on issue 2411
+-- group: [timestamp]
+
+
+PRAGMA enable_verification;
+
+
+CREATE TABLE timestamp1(i TIMESTAMP);
+
+
+CREATE TABLE timestamp2(i TIMESTAMP);
+
+
+INSERT INTO timestamp1 VALUES ('1993-08-14 00:00:01');
+
+
+INSERT INTO timestamp2 VALUES ('1993-08-14 00:00:01');
+
+
+select count(*) from timestamp2 inner join timestamp1 on (timestamp1.i = timestamp2.i);
