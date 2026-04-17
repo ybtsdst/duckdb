@@ -26,7 +26,8 @@
         "GitHub.copilot",
         "DrBlury.protobuf-vsc",
         "llvm-vs-code-extensions.vscode-clangd",
-        "eamodio.gitlens"
+        "eamodio.gitlens",
+        "Anthropic.claude-code"
       ]
     }
   },
