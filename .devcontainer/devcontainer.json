@@ -27,7 +27,8 @@
         "DrBlury.protobuf-vsc",
         "llvm-vs-code-extensions.vscode-clangd",
         "eamodio.gitlens",
-        "Anthropic.claude-code"
+        "Anthropic.claude-code",
+        "vadimcn.vscode-lldb"
       ]
     }
   },
