@@ -8,7 +8,7 @@
       "name": "(gdb) Attach",
       "type": "cppdbg",
       "request": "attach",
-      "program": "${workspaceFolder}/build/reldebug/duckdb",
+      "program": "${workspaceFolder}/build/debug/duckdb",
       "processId": "${command:pickProcess}",
       "MIMode": "gdb",
       "setupCommands": [
@@ -22,7 +22,7 @@
           "text": "-gdb-set disassembly-flavor intel",
           "ignoreFailures": true
         }
-      ]
+      ],
     },
     {
       "name": "(gdb) Launch duckdb in memory",
@@ -75,6 +75,15 @@
           "text": "-gdb-set disassembly-flavor intel",
           "ignoreFailures": true
         }
+      ]
+    },
+    {
+      "name": "(lldb) Attach",
+      "type": "lldb",
+      "request": "attach",
+      "program": "${workspaceFolder}/build/debug/duckdb",
+      "pid": "${command:pickMyProcess}",
+      "initCommands": [
       ]
     }
   ]
