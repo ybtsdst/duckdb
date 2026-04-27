@@ -20,7 +20,6 @@
 #include "duckdb/parallel/pipeline_tracer.hpp"
 #include "duckdb/parallel/task_scheduler.hpp"
 #include "duckdb/parallel/thread_context.hpp"
-#include "duckdb/main/client_config.hpp"
 
 #include <algorithm>
 #include <chrono>
