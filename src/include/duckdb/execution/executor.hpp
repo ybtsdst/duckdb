@@ -155,6 +155,10 @@ private:
 	vector<shared_ptr<Pipeline>> pipelines;
 	//! The root pipelines of the query
 	vector<shared_ptr<Pipeline>> root_pipelines;
+	//! Pipelines saved for trace output (persists after pipelines.clear())
+	vector<shared_ptr<Pipeline>> traced_pipelines;
+	//! Steady-clock nanoseconds at query initialization (base for Chrome trace timestamps)
+	int64_t pipeline_trace_start_ns = 0;
 	//! The recursive CTE's in this query plan
 	vector<reference<PhysicalOperator>> recursive_ctes;
 	//! The pipeline executor for the root pipeline

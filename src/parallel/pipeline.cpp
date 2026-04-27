@@ -1,6 +1,7 @@
 #include "duckdb/parallel/pipeline.hpp"
 
 #include "duckdb/common/algorithm.hpp"
+#include "duckdb/common/chrono.hpp"
 #include "duckdb/common/printer.hpp"
 #include "duckdb/common/tree_renderer/text_tree_renderer.hpp"
 #include "duckdb/execution/executor.hpp"
@@ -71,6 +72,16 @@ Pipeline::Pipeline(Executor &executor_p)
 
 ClientContext &Pipeline::GetClientContext() {
 	return executor.context;
+}
+
+void Pipeline::MarkStart() {
+	start_time_ns = static_cast<int64_t>(
+	    duration_cast<nanoseconds>(steady_clock::now().time_since_epoch()).count());
+}
+
+void Pipeline::MarkEnd() {
+	end_time_ns = static_cast<int64_t>(
+	    duration_cast<nanoseconds>(steady_clock::now().time_since_epoch()).count());
 }
 
 bool Pipeline::GetProgress(ProgressData &progress) {

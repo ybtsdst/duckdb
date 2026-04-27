@@ -76,6 +76,7 @@ class Pipeline : public enable_shared_from_this<Pipeline> {
 	friend class PipelineFinishEvent;
 	friend class PipelineBuildState;
 	friend class MetaPipeline;
+	friend class PipelineTracer;
 
 public:
 	explicit Pipeline(Executor &execution_context);
@@ -99,6 +100,21 @@ public:
 	string ToString() const;
 	void Print() const;
 	void PrintDependencies() const;
+
+	//! Record the wall-clock start time of this pipeline's execution.
+	void MarkStart();
+	//! Record the wall-clock end time (last-call wins, so PipelineFinishEvent overwrites PipelineEvent).
+	void MarkEnd();
+
+	idx_t GetPipelineId() const {
+		return pipeline_id;
+	}
+	int64_t GetStartTimeNs() const {
+		return start_time_ns;
+	}
+	int64_t GetEndTimeNs() const {
+		return end_time_ns;
+	}
 
 	//! Returns query progress
 	bool GetProgress(ProgressData &progress_data);
@@ -132,6 +148,12 @@ private:
 	atomic<bool> initialized;
 	//! The source of this pipeline
 	optional_ptr<PhysicalOperator> source;
+
+	//! Pipeline ID assigned by PipelineTracer::AssignIds (0-based)
+	idx_t pipeline_id = 0;
+	//! Wall-clock start/end times in steady_clock nanoseconds since epoch (-1 = unset)
+	int64_t start_time_ns = -1;
+	int64_t end_time_ns = -1;
 	//! The chain of intermediate operators
 	vector<reference<PhysicalOperator>> operators;
 	//! The sink (i.e. destination) for data; this is e.g. a hash table to-be-built

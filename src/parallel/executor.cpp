@@ -1,5 +1,6 @@
 #include "duckdb/execution/executor.hpp"
 
+#include "duckdb/common/chrono.hpp"
 #include "duckdb/execution/execution_context.hpp"
 #include "duckdb/execution/operator/helper/physical_result_collector.hpp"
 #include "duckdb/execution/operator/scan/physical_table_scan.hpp"
@@ -16,8 +17,10 @@
 #include "duckdb/parallel/pipeline_finish_event.hpp"
 #include "duckdb/parallel/pipeline_initialize_event.hpp"
 #include "duckdb/parallel/pipeline_prepare_finish_event.hpp"
+#include "duckdb/parallel/pipeline_tracer.hpp"
 #include "duckdb/parallel/task_scheduler.hpp"
 #include "duckdb/parallel/thread_context.hpp"
+#include "duckdb/main/client_config.hpp"
 
 #include <algorithm>
 #include <chrono>
@@ -424,6 +427,16 @@ void Executor::InitializeInternal(PhysicalOperator &plan) {
 		// finally, verify and schedule
 		VerifyPipelines();
 		ScheduleEvents(to_schedule);
+
+		// pipeline trace: assign IDs, record query start time, and print the static graph
+		auto &trace_config = ClientConfig::GetConfig(context);
+		if (trace_config.enable_pipeline_trace) {
+			PipelineTracer::AssignIds(pipelines);
+			pipeline_trace_start_ns = static_cast<int64_t>(
+			    duration_cast<nanoseconds>(steady_clock::now().time_since_epoch()).count());
+			PipelineTracer::PrintGraph(pipelines);
+			traced_pipelines = pipelines;
+		}
 	}
 }
 
@@ -622,6 +635,11 @@ PendingExecutionResult Executor::ExecuteTask(bool dry_run) {
 	D_ASSERT(!task);
 
 	lock_guard<mutex> elock(executor_lock);
+	// emit Chrome Trace JSON before clearing pipelines (timing data lives in Pipeline objects)
+	if (!traced_pipelines.empty()) {
+		PipelineTracer::PrintChromeTrace(traced_pipelines, pipeline_trace_start_ns);
+		traced_pipelines.clear();
+	}
 	pipelines.clear();
 	NextExecutor();
 	if (HasError()) { // LCOV_EXCL_START
@@ -647,6 +665,8 @@ void Executor::Reset() {
 	events.clear();
 	to_be_rescheduled_tasks.clear();
 	execution_result = PendingExecutionResult::RESULT_NOT_READY;
+	traced_pipelines.clear();
+	pipeline_trace_start_ns = 0;
 }
 
 shared_ptr<Pipeline> Executor::CreateChildPipeline(Pipeline &current, PhysicalOperator &op) {

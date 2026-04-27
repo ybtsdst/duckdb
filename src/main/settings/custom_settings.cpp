@@ -1206,6 +1206,22 @@ Value EnableHTTPLoggingSetting::GetSetting(const ClientContext &context) {
 }
 
 //===----------------------------------------------------------------------===//
+// Enable Pipeline Trace
+//===----------------------------------------------------------------------===//
+
+void EnablePipelineTraceSetting::SetLocal(ClientContext &context, const Value &input) {
+	ClientConfig::GetConfig(context).enable_pipeline_trace = input.GetValue<bool>();
+}
+
+void EnablePipelineTraceSetting::ResetLocal(ClientContext &context) {
+	ClientConfig::GetConfig(context).enable_pipeline_trace = ClientConfig().enable_pipeline_trace;
+}
+
+Value EnablePipelineTraceSetting::GetSetting(const ClientContext &context) {
+	return Value::BOOLEAN(ClientConfig::GetConfig(context).enable_pipeline_trace);
+}
+
+//===----------------------------------------------------------------------===//
 // Enable Mbedtls
 //===----------------------------------------------------------------------===//
 

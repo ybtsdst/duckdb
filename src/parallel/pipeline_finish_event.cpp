@@ -84,6 +84,7 @@ void PipelineFinishEvent::Schedule() {
 }
 
 void PipelineFinishEvent::FinishEvent() {
+	pipeline->MarkEnd();
 }
 
 } // namespace duckdb
