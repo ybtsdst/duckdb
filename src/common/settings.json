@@ -904,6 +904,22 @@
         "default_value": "auto"
     },
     {
+        "name": "pipeline_graph_output",
+        "description": "File path for pipeline graph output when enable_pipeline_trace is true (empty = stderr)",
+        "type": "VARCHAR",
+        "scope": "local",
+        "struct": "PipelineGraphOutputSetting",
+        "custom_implementation": true
+    },
+    {
+        "name": "pipeline_trace_output",
+        "description": "File path for Chrome Trace JSON output when enable_pipeline_trace is true (empty = stderr)",
+        "type": "VARCHAR",
+        "scope": "local",
+        "struct": "PipelineTraceOutputSetting",
+        "custom_implementation": true
+    },
+    {
         "name": "pivot_filter_threshold",
         "description": "The threshold to switch from using filtered aggregates to LIST with a dedicated pivot operator",
         "type": "UBIGINT",

@@ -433,7 +433,7 @@ void Executor::InitializeInternal(PhysicalOperator &plan) {
 			PipelineTracer::AssignIds(pipelines);
 			pipeline_trace_start_ns = static_cast<int64_t>(
 			    duration_cast<nanoseconds>(steady_clock::now().time_since_epoch()).count());
-			PipelineTracer::PrintGraph(pipelines);
+			PipelineTracer::PrintGraph(pipelines, trace_config.pipeline_graph_output);
 			traced_pipelines = pipelines;
 		}
 	}
@@ -636,7 +636,8 @@ PendingExecutionResult Executor::ExecuteTask(bool dry_run) {
 	lock_guard<mutex> elock(executor_lock);
 	// emit Chrome Trace JSON before clearing pipelines (timing data lives in Pipeline objects)
 	if (!traced_pipelines.empty()) {
-		PipelineTracer::PrintChromeTrace(traced_pipelines, pipeline_trace_start_ns);
+		auto &trace_config = ClientConfig::GetConfig(context);
+		PipelineTracer::PrintChromeTrace(traced_pipelines, pipeline_trace_start_ns, trace_config.pipeline_trace_output);
 		traced_pipelines.clear();
 	}
 	pipelines.clear();

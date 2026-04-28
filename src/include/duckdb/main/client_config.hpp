@@ -104,6 +104,10 @@ struct ClientConfig {
 	//! If pipeline trace logging is enabled (SET enable_pipeline_trace = true).
 	//! Prints the pipeline dependency graph and Chrome Trace JSON timing to stderr.
 	bool enable_pipeline_trace = false;
+	//! File path for pipeline graph output (empty = stderr).
+	string pipeline_graph_output;
+	//! File path for Chrome Trace JSON output (empty = stderr).
+	string pipeline_trace_output;
 
 	//! **DEPRECATED** The file to save query HTTP logging information to, instead of printing it to the console
 	//! (empty = output to the DuckDB logger)

@@ -5,6 +5,8 @@
 #include "duckdb/execution/physical_operator.hpp"
 #include "duckdb/parallel/pipeline.hpp"
 
+#include <fstream>
+
 namespace duckdb {
 
 void PipelineTracer::AssignIds(vector<shared_ptr<Pipeline>> &pipelines) {
@@ -25,7 +27,22 @@ string PipelineTracer::Describe(const Pipeline &pipeline) {
 	return result;
 }
 
-void PipelineTracer::PrintGraph(const vector<shared_ptr<Pipeline>> &pipelines) {
+void PipelineTracer::WriteOutput(const string &content, const string &output_path) {
+	if (output_path.empty()) {
+		Printer::Print(OutputStream::STREAM_STDERR, content);
+		return;
+	}
+	std::ofstream f(output_path, std::ios::out | std::ios::trunc);
+	if (!f.is_open()) {
+		// Fall back to stderr if the file cannot be opened
+		Printer::Print(OutputStream::STREAM_STDERR,
+		               "pipeline_tracer: could not open '" + output_path + "', falling back to stderr\n" + content);
+		return;
+	}
+	f << content;
+}
+
+void PipelineTracer::PrintGraph(const vector<shared_ptr<Pipeline>> &pipelines, const string &output_path) {
 	string out = "\n=== Pipeline Graph ===\n";
 	for (auto &p : pipelines) {
 		out += "Pipeline #" + to_string(p->pipeline_id) + ": " + Describe(*p) + "\n";
@@ -42,10 +59,11 @@ void PipelineTracer::PrintGraph(const vector<shared_ptr<Pipeline>> &pipelines) {
 		}
 	}
 	out += "======================\n";
-	Printer::Print(OutputStream::STREAM_STDERR, out);
+	WriteOutput(out, output_path);
 }
 
-void PipelineTracer::PrintChromeTrace(const vector<shared_ptr<Pipeline>> &pipelines, int64_t query_start_ns) {
+void PipelineTracer::PrintChromeTrace(const vector<shared_ptr<Pipeline>> &pipelines, int64_t query_start_ns,
+                                      const string &output_path) {
 	string events;
 	bool first = true;
 	for (auto &p : pipelines) {
@@ -68,8 +86,8 @@ void PipelineTracer::PrintChromeTrace(const vector<shared_ptr<Pipeline>> &pipeli
 		events += "{\"name\":\"" + name + "\",\"ph\":\"X\",\"pid\":0,\"tid\":" + to_string(p->pipeline_id) +
 		          ",\"ts\":" + to_string(start_us) + ",\"dur\":" + to_string(dur_us) + "}";
 	}
-	string json = "\n{\"traceEvents\":[\n  " + events + "\n]}\n";
-	Printer::Print(OutputStream::STREAM_STDERR, json);
+	string json = "{\"traceEvents\":[\n  " + events + "\n]}\n";
+	WriteOutput(json, output_path);
 }
 
 } // namespace duckdb

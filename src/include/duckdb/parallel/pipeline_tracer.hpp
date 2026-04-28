@@ -16,26 +16,32 @@ class Pipeline;
 
 //! PipelineTracer collects and outputs pipeline structure and execution timing.
 //! Enabled by SET enable_pipeline_trace = true.
-//! Outputs:
-//!   1. A pipeline dependency graph to stderr after initialization.
-//!   2. A Chrome Trace JSON timing report to stderr after query completion
-//!      (loadable in https://ui.perfetto.dev/ or chrome://tracing).
+//!
+//! Output destinations (empty string = stderr):
+//!   SET pipeline_graph_output  = '/path/graph.txt'   -- pipeline dependency graph
+//!   SET pipeline_trace_output  = '/path/trace.json'  -- Chrome Trace JSON (Perfetto)
 class PipelineTracer {
 public:
 	//! Assign sequential IDs (0, 1, 2, ...) to all pipelines.
 	//! Must be called before PrintGraph or PrintChromeTrace.
 	static void AssignIds(vector<shared_ptr<Pipeline>> &pipelines);
 
-	//! Print the static pipeline structure and dependency graph to stderr.
-	static void PrintGraph(const vector<shared_ptr<Pipeline>> &pipelines);
+	//! Print the static pipeline structure and dependency graph.
+	//! output_path: file path to write to, or empty string for stderr.
+	static void PrintGraph(const vector<shared_ptr<Pipeline>> &pipelines, const string &output_path);
 
-	//! Print Chrome Trace JSON to stderr.
+	//! Print Chrome Trace JSON (loadable in https://ui.perfetto.dev/).
 	//! query_start_ns: steady_clock nanoseconds since epoch at query start.
-	static void PrintChromeTrace(const vector<shared_ptr<Pipeline>> &pipelines, int64_t query_start_ns);
+	//! output_path: file path to write to, or empty string for stderr.
+	static void PrintChromeTrace(const vector<shared_ptr<Pipeline>> &pipelines, int64_t query_start_ns,
+	                             const string &output_path);
 
 private:
 	//! Build a short human-readable description: "TableScan→HashJoinBuild→..."
 	static string Describe(const Pipeline &pipeline);
+
+	//! Write content to output_path if non-empty, otherwise to stderr.
+	static void WriteOutput(const string &content, const string &output_path);
 };
 
 } // namespace duckdb
