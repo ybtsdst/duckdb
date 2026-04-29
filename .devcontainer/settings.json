@@ -32,13 +32,11 @@
         "--query-driver=/usr/bin/gcc",
         "--suggest-missing-includes",
         "--cross-file-rename",
-        "--compile-commands-dir=/opt/transwarp/duckdb/build/debug",
         "--completion-style=detailed",
-        "-j=80",
+        "-j=16",
         "--all-scopes-completion",
-        // "--limit-references=100",
-        // "--limit-results=20",
-        "--malloc-trim"
+        "--malloc-trim",
+        "--completion-parse=always",
     ],
     "terminal.integrated.profiles.linux": {
         "bash (login)": {

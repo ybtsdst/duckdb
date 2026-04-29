@@ -1,5 +1,6 @@
 CompileFlags:
-  CompilationDatabase: .cache/clangd
+  #CompilationDatabase: .cache/clangd
+  CompilationDatabase: build/reldebug
   Add: -Wno-unqualified-std-cast-call
 
 # Keep this list in sync with tidy-check-diff exclusions in the Makefile.
