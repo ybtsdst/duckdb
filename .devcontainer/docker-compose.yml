@@ -21,6 +21,8 @@ services:
       - ..:/opt/transwarp/duckdb:cached
       - /var/run/docker.sock:/var/run/docker.sock
       - ${LOCAL_CCACHE}:/opt/ccache:cached
+      - ${HOME}/.claude:/home/${DEV_USERNAME:-dev}/.claude:cached
+      - ${HOME}/.claude.json:/home/${DEV_USERNAME:-dev}/.claude.json:cached
     working_dir: /opt/transwarp/duckdb
     network_mode: host 
     tty: true

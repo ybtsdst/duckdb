@@ -28,7 +28,7 @@ RUN \
   apt-get install -y ${PKGS} && \    
   add-apt-repository -y ppa:ubuntu-toolchain-r/ppa && \
   apt-get update -y && \    
-  PKGS="vim sudo locales git curl unzip wget zip iputils-ping iproute2 tzdata tree jq" && \    
+  PKGS="vim sudo locales git curl unzip wget zip iputils-ping iproute2 tzdata tree jq python3 python3-pip" && \    
   PKGS="${PKGS} gdb net-tools telnet cmake ninja-build ccache linux-tools-common linux-tools-generic" && \    
   PKGS="${PKGS} google-perftools valgrind" && \    
   apt-get install -y ${PKGS} && \    

@@ -1,3 +1,4 @@
 CompileFlags:
-  CompilationDatabase: .cache/clangd
+  #CompilationDatabase: .cache/clangd
+  CompilationDatabase: build/reldebug
   Add: -Wno-unqualified-std-cast-call
