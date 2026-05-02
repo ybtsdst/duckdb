@@ -9,7 +9,6 @@ PipelineEvent::PipelineEvent(shared_ptr<Pipeline> pipeline_p) : BasePipelineEven
 void PipelineEvent::Schedule() {
 	auto event = shared_from_this();
 	auto &executor = pipeline->executor;
-	pipeline->MarkStart();
 	try {
 		pipeline->Schedule(event);
 		D_ASSERT(total_tasks > 0);
@@ -21,7 +20,6 @@ void PipelineEvent::Schedule() {
 }
 
 void PipelineEvent::FinishEvent() {
-	pipeline->MarkEnd();
 }
 
 } // namespace duckdb

@@ -70,24 +70,31 @@ void PipelineTracer::PrintChromeTrace(const vector<shared_ptr<Pipeline>> &pipeli
 	string events;
 	bool first = true;
 	for (auto &p : pipelines) {
-		if (p->start_time_ns < 0 || p->end_time_ns < 0) {
-			continue;
+		string desc = Describe(*p);
+		// Escape quotes for JSON safety; do it once per pipeline, not per task.
+		desc = StringUtil::Replace(desc, "\"", "\\\"");
+		// One Chrome Trace event per PipelineTask: each parallel slice of the pipeline gets
+		// its own bar. tid = thread hash so each worker thread occupies its own row in
+		// Perfetto, making real parallelism visible.
+		idx_t task_idx = 0;
+		for (auto &t : p->task_timings) {
+			int64_t start_us = (t.start_ns - query_start_ns) / 1000;
+			int64_t dur_us = (t.end_ns - t.start_ns) / 1000;
+			if (dur_us < 0) {
+				dur_us = 0;
+			}
+			// Mask to a 31-bit non-negative value for tools that treat tid as signed int32.
+			uint64_t tid = t.thread_hash & 0x7fffffffULL;
+			if (!first) {
+				events += ",\n  ";
+			} else {
+				first = false;
+			}
+			events += "{\"name\":\"#" + to_string(p->pipeline_id) + "[" + to_string(task_idx) + "]: " + desc +
+			          "\",\"ph\":\"X\",\"pid\":0,\"tid\":" + to_string(tid) +
+			          ",\"ts\":" + to_string(start_us) + ",\"dur\":" + to_string(dur_us) + "}";
+			task_idx++;
 		}
-		int64_t start_us = (p->start_time_ns - query_start_ns) / 1000;
-		int64_t dur_us = (p->end_time_ns - p->start_time_ns) / 1000;
-		if (dur_us < 0) {
-			dur_us = 0;
-		}
-		if (!first) {
-			events += ",\n  ";
-		} else {
-			first = false;
-		}
-		string name = "#" + to_string(p->pipeline_id) + ": " + Describe(*p);
-		// Escape quotes in name for JSON safety (StringUtil::Replace is global, returns new string)
-		name = StringUtil::Replace(name, "\"", "\\\"");
-		events += "{\"name\":\"" + name + "\",\"ph\":\"X\",\"pid\":0,\"tid\":" + to_string(p->pipeline_id) +
-		          ",\"ts\":" + to_string(start_us) + ",\"dur\":" + to_string(dur_us) + "}";
 	}
 	string json = "{\"traceEvents\":[\n  " + events + "\n]}\n";
 	// Truncate: Chrome Trace JSON must be a single valid JSON object; concatenating
