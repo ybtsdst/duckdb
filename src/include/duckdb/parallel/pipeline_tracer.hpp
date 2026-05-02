@@ -41,7 +41,10 @@ private:
 	static string Describe(const Pipeline &pipeline);
 
 	//! Write content to output_path if non-empty, otherwise to stderr.
-	static void WriteOutput(const string &content, const string &output_path);
+	//! append=true opens the file in append mode (used for the graph, which accumulates
+	//! across queries); append=false truncates (used for the Chrome Trace JSON, which
+	//! must remain a single valid JSON object per file).
+	static void WriteOutput(const string &content, const string &output_path, bool append);
 };
 
 } // namespace duckdb

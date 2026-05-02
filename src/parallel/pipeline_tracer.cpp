@@ -27,12 +27,13 @@ string PipelineTracer::Describe(const Pipeline &pipeline) {
 	return result;
 }
 
-void PipelineTracer::WriteOutput(const string &content, const string &output_path) {
+void PipelineTracer::WriteOutput(const string &content, const string &output_path, bool append) {
 	if (output_path.empty()) {
 		Printer::Print(OutputStream::STREAM_STDERR, content);
 		return;
 	}
-	std::ofstream f(output_path, std::ios::out | std::ios::trunc);
+	auto mode = std::ios::out | (append ? std::ios::app : std::ios::trunc);
+	std::ofstream f(output_path, mode);
 	if (!f.is_open()) {
 		// Fall back to stderr if the file cannot be opened
 		Printer::Print(OutputStream::STREAM_STDERR,
@@ -59,7 +60,9 @@ void PipelineTracer::PrintGraph(const vector<shared_ptr<Pipeline>> &pipelines, c
 		}
 	}
 	out += "======================\n";
-	WriteOutput(out, output_path);
+	// Append: the graph is plain text and the per-query "=== Pipeline Graph ===" header
+	// already separates entries, so multiple queries in the same session accumulate cleanly.
+	WriteOutput(out, output_path, /*append=*/true);
 }
 
 void PipelineTracer::PrintChromeTrace(const vector<shared_ptr<Pipeline>> &pipelines, int64_t query_start_ns,
@@ -81,13 +84,15 @@ void PipelineTracer::PrintChromeTrace(const vector<shared_ptr<Pipeline>> &pipeli
 			first = false;
 		}
 		string name = "#" + to_string(p->pipeline_id) + ": " + Describe(*p);
-		// Escape quotes in name for JSON safety
-		StringUtil::ReplaceAll(name, "\"", "\\\"");
+		// Escape quotes in name for JSON safety (StringUtil::Replace is global, returns new string)
+		name = StringUtil::Replace(name, "\"", "\\\"");
 		events += "{\"name\":\"" + name + "\",\"ph\":\"X\",\"pid\":0,\"tid\":" + to_string(p->pipeline_id) +
 		          ",\"ts\":" + to_string(start_us) + ",\"dur\":" + to_string(dur_us) + "}";
 	}
 	string json = "{\"traceEvents\":[\n  " + events + "\n]}\n";
-	WriteOutput(json, output_path);
+	// Truncate: Chrome Trace JSON must be a single valid JSON object; concatenating
+	// per-query traces would produce invalid JSON. Each query overwrites the file.
+	WriteOutput(json, output_path, /*append=*/false);
 }
 
 } // namespace duckdb

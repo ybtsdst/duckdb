@@ -128,6 +128,7 @@ static const ConfigurationOption internal_options[] = {
     DUCKDB_GLOBAL(EnableLogging),
     DUCKDB_SETTING(EnableMacroDependenciesSetting),
     DUCKDB_SETTING(EnableObjectCacheSetting),
+    DUCKDB_LOCAL(EnablePipelineTraceSetting),
     DUCKDB_LOCAL(EnableProfilingSetting),
     DUCKDB_LOCAL(EnableProgressBarSetting),
     DUCKDB_LOCAL(EnableProgressBarPrintSetting),
@@ -177,6 +178,8 @@ static const ConfigurationOption internal_options[] = {
     DUCKDB_SETTING(PasswordSetting),
     DUCKDB_SETTING_CALLBACK(PerfectHtThresholdSetting),
     DUCKDB_SETTING_CALLBACK(PinThreadsSetting),
+    DUCKDB_LOCAL(PipelineGraphOutputSetting),
+    DUCKDB_LOCAL(PipelineTraceOutputSetting),
     DUCKDB_SETTING(PivotFilterThresholdSetting),
     DUCKDB_SETTING(PivotLimitSetting),
     DUCKDB_SETTING(PreferRangeJoinsSetting),
@@ -208,12 +211,12 @@ static const ConfigurationOption internal_options[] = {
     DUCKDB_SETTING(ZstdMinStringLengthSetting),
     FINAL_SETTING};
 
-static const ConfigurationAlias setting_aliases[] = {DUCKDB_SETTING_ALIAS("memory_limit", 99),
+static const ConfigurationAlias setting_aliases[] = {DUCKDB_SETTING_ALIAS("memory_limit", 100),
                                                      DUCKDB_SETTING_ALIAS("null_order", 43),
-                                                     DUCKDB_SETTING_ALIAS("profiling_output", 118),
-                                                     DUCKDB_SETTING_ALIAS("user", 133),
+                                                     DUCKDB_SETTING_ALIAS("profiling_output", 121),
+                                                     DUCKDB_SETTING_ALIAS("user", 136),
                                                      DUCKDB_SETTING_ALIAS("wal_autocheckpoint", 25),
-                                                     DUCKDB_SETTING_ALIAS("worker_threads", 132),
+                                                     DUCKDB_SETTING_ALIAS("worker_threads", 135),
                                                      FINAL_ALIAS};
 
 vector<ConfigurationOption> DBConfig::GetOptions() {

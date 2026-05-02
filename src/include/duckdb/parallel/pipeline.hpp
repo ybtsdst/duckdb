@@ -151,9 +151,11 @@ private:
 
 	//! Pipeline ID assigned by PipelineTracer::AssignIds (0-based)
 	idx_t pipeline_id = 0;
-	//! Wall-clock start/end times in steady_clock nanoseconds since epoch (-1 = unset)
-	int64_t start_time_ns = -1;
-	int64_t end_time_ns = -1;
+	//! Wall-clock start/end times in steady_clock nanoseconds since epoch (-1 = unset).
+	//! Atomic because MarkStart/MarkEnd may run on different worker threads than the
+	//! reader (PipelineTracer::PrintChromeTrace).
+	atomic<int64_t> start_time_ns {-1};
+	atomic<int64_t> end_time_ns {-1};
 	//! The chain of intermediate operators
 	vector<reference<PhysicalOperator>> operators;
 	//! The sink (i.e. destination) for data; this is e.g. a hash table to-be-built
