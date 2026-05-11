@@ -282,7 +282,7 @@ parallel_streaming_insert && num_threads > 1
 
 ### 5.3 并行替代方案：PhysicalBatchInsert
 
-在相同数据量和多线程环境下，若无 ON CONFLICT 子句且数据源支持批次索引，计划器会选择 `PhysicalBatchInsert`（见第六节）。`PhysicalBatchInsert` 通过以下机制避免 `Combine()` 的串行瓶颈：
+在多线程环境下，若数据源支持批次索引、无 ON CONFLICT 子句，**且 `parallel_streaming_insert` 为 `false`（即必须保留插入顺序）**，计划器才会选择 `PhysicalBatchInsert`（见第六节，`plan_insert.cpp:122`）。换言之，即便支持批次索引，只要不需要保序（`parallel_streaming_insert == true`），计划器仍优先走 `PhysicalInsert(parallel=true)` 流式并行路径。`PhysicalBatchInsert` 通过以下机制避免 `Combine()` 的串行瓶颈：
 
 - 每个线程只写独立的批次（`BatchIndex` 隔离），`Combine()` 仅将本批次注册到全局 `collections`，无需持有长时间锁。
 - 真正的合并工作由后台 `MergeCollectionTask` 异步执行，与 `Sink()` 流水线化。
