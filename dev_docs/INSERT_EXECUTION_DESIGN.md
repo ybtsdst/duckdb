@@ -161,7 +161,7 @@ OnConflictHandling(insert_chunk)
 │   ├─ HandleInsertConflicts<true>()   // 与全局存储对比冲突
 │   └─ HandleInsertConflicts<false>()  // 与事务本地存储对比冲突
 │       ├─ VerifyAppendConstraints / VerifyUniqueIndexes → ConflictManager
-│       ├─ 扫描冲突行的现有值（Fetch）
+│       ├─ 若 `types_to_fetch` 非空（如 `WHERE` 条件或 `SET` 表达式引用现有值）→ 扫描冲突行的现有值（Fetch）
 │       ├─ VerifyOnConflictCondition（WHERE 子句）
 │       ├─ PerformOnConflictAction：Update / Delete+Insert
 │       └─ 从 insert_chunk 中移除冲突行（Slice）
@@ -245,9 +245,9 @@ if (!parallel || !lstate.collection_index.IsValid()) {
 parallel_streaming_insert && num_threads > 1
 ```
 
-其中 `parallel_streaming_insert = !PreserveInsertionOrder(context, *plan)`。换言之，只有在以下全部条件成立时，`parallel` 才为 `true`：
+其中 `parallel_streaming_insert = !PreserveInsertionOrder(context, *plan)`，即当**不需要保留插入顺序**时为 `true`（数据源为 `NO_ORDER` 时无论配置如何均不保序；数据源为 `INSERTION_ORDER` 时取决于 `preserve_insertion_order` 配置；`FIXED_ORDER` 始终保序，见 §6.1）。换言之，只有在以下全部条件成立时，`parallel` 才为 `true`：
 
-1. `preserve_insertion_order` 配置为 `false`，且数据源的顺序类型为 `INSERTION_ORDER`（既不是 `FIXED_ORDER` 也不是 `NO_ORDER`）；或者数据源本身为 `NO_ORDER`（始终允许乱序）。
+1. `PreserveInsertionOrder()` 返回 `false`（数据源为 `NO_ORDER`，或数据源为 `INSERTION_ORDER` 且 `preserve_insertion_order` 配置为 `false`）。
 2. 线程数 > 1。
 3. `action_type != UPDATE`（`DO UPDATE` 需要防止同一行被更新两次，不支持并行流式写入）。
 4. `return_chunk == false`（`RETURNING` 子句当前不支持并行路径）。
@@ -256,7 +256,7 @@ parallel_streaming_insert && num_threads > 1
 
 ## 五、Combine 慢路径详解（`parallel == true` 时的串行合并）
 
-当 `parallel == true`（即 `preserve_insertion_order = false` 且满足其余条件）时，`Combine()` 的 `!parallel` 条件不成立，不再快速返回，而是执行如下串行化合并——这正是"慢路径"的含义。`parallel == true` 的完整前置条件参见第四节：除 `preserve_insertion_order = false` 外，还要求线程数 > 1、无 `DO UPDATE` 子句、无 `RETURNING` 子句。
+当 `parallel == true`（即不需要保留插入顺序且满足其余条件）时，`Combine()` 的 `!parallel` 条件不成立，不再快速返回，而是执行如下串行化合并——这正是"慢路径"的含义。`parallel == true` 的完整前置条件参见第四节：`PreserveInsertionOrder()` 需返回 `false`，还要求线程数 > 1、无 `DO UPDATE` 子句、无 `RETURNING` 子句。
 
 ### 5.1 为什么串行
 
@@ -288,7 +288,7 @@ parallel_streaming_insert && num_threads > 1
 - 真正的合并工作由后台 `MergeCollectionTask` 异步执行，与 `Sink()` 流水线化。
 - 全局合并与刷盘推迟到 `Finalize()` 阶段统一完成（见 `BATCH_INSERT_DESIGN.md` §四）。
 
-`PhysicalInsert` 并行路径的 `Combine()` 慢路径之所以存在，是因为它需要兼容 ON CONFLICT 子句和 RETURNING，而这些特性需要在写入时访问全局状态，无法实现批次级隔离。
+`PhysicalInsert` 并行路径（`parallel=true`）适用于普通 INSERT 以及不需要 UPDATE 的冲突处理（`DO NOTHING`/`DO REPLACE`）。`RETURNING` 子句和 `DO UPDATE` 冲突处理会在计划阶段将 `parallel_streaming_insert` 强制置为 `false`（`plan_insert.cpp:105-108`、`:114-118`），因此它们始终走非并行路径，不会触发 `Combine()` 的串行慢路径。`Combine()` 慢路径之所以存在，是因为并行写入最终需要将各线程的 `RowGroupCollection` 归并进事务本地存储，而事务本地存储不支持并发写入，必须串行化。
 
 ---
 
@@ -352,6 +352,6 @@ if (use_batch_index && !parallel_streaming_insert) {
 
 `PhysicalInsert` 的并行路径（`parallel = true`）是一种"先并行写入、后串行合并"的折中方案。各线程在 `Sink()` 阶段完全并行地向各自的 `OptimisticCollection` 追加数据，充分利用多核写入能力；而 `Combine()` 阶段的串行化合并是不可避免的代价——事务本地存储不支持并发写入，且 `insert_count` 需要全局汇总。对于小数据量（< 1 个 Row Group），串行合并的开销可以忽略；对于大数据量，`Combine()` 的串行临界区会成为瓶颈，此时 `PhysicalBatchInsert` 是更好的选择。
 
-`Finalize()` 的空实现是有意为之。`PhysicalInsert` 将数据归并的时机前移到 `Combine()` 而非 `Finalize()`，原因是 ON CONFLICT 处理和 RETURNING 子句都需要在每个 Chunk 被消费时立即处理，不存在需要推迟到全局收尾阶段的操作。这与 `PhysicalBatchInsert` 将大量工作推迟到 `Finalize()` 的策略不同，是两种算子适用场景差异的直接体现。
+`Finalize()` 的空实现是有意为之。`PhysicalInsert` 将数据归并的时机前移到 `Combine()`（并行路径：`RowGroupCollection` 归并进事务本地存储）或 `Sink()`（非并行路径：直接 `LocalAppend`），不存在需要推迟到全局收尾阶段的操作。`RETURNING` 子句和 `DO UPDATE` 冲突处理均强制走非并行路径，在各自的 `Sink()` 调用中实时处理，同样无需 `Finalize()` 介入。这与 `PhysicalBatchInsert` 将大量工作推迟到 `Finalize()` 的策略不同，是两种算子适用场景差异的直接体现。
 
 `InsertLocalState.collection_index` 的懒初始化（在首次 `Sink()` 调用时才分配 `OptimisticCollection`）确保了空写入线程不会占用不必要的存储资源，同时使 `Combine()` 中 `!lstate.collection_index.IsValid()` 的快速返回路径成为可能，减少了无数据线程的合并开销。
