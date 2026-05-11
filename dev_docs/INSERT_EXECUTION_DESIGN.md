@@ -239,7 +239,7 @@ if (!parallel || !lstate.collection_index.IsValid()) {
 
 只有当 `parallel == true` 且线程确实写入了数据时，`Combine()` 才执行实际的合并操作。
 
-`parallel` 字段由计划器在构造 `PhysicalInsert` 时注入（`plan_insert.cpp:132`）：
+`parallel` 字段由计划器在构造 `PhysicalInsert` 时注入（`plan_insert.cpp:129`，`PhysicalInsert` 构造分支）：
 
 ```cpp
 parallel_streaming_insert && num_threads > 1
@@ -294,7 +294,7 @@ parallel_streaming_insert && num_threads > 1
 
 ## 六、计划器如何选择 PhysicalInsert vs PhysicalBatchInsert
 
-计划入口为 `DuckCatalog::PlanInsert()`（`plan_insert.cpp:99`），核心决策逻辑如下：
+计划入口为 `DuckCatalog::PlanInsert()`（`plan_insert.cpp:100`），核心决策逻辑如下：
 
 ```cpp
 // plan_insert.cpp:102
@@ -312,7 +312,7 @@ if (use_batch_index && !parallel_streaming_insert) {
 }
 ```
 
-### 6.1 PreserveInsertionOrder（`plan_insert.cpp:36`）
+### 6.1 PreserveInsertionOrder（`plan_insert.cpp:37`）
 
 递归检查子计划树的顺序保证类型（`OrderPreservationRecursive`），结合配置 `preserve_insertion_order` 做出决策：
 
@@ -322,7 +322,7 @@ if (use_batch_index && !parallel_streaming_insert) {
 | `NO_ORDER`（如 Hash Join 输出） | `false`（允许乱序） |
 | `INSERTION_ORDER`（默认） | 取决于 `preserve_insertion_order` 配置（默认 `true`） |
 
-### 6.2 UseBatchIndex（`plan_insert.cpp:58`）
+### 6.2 UseBatchIndex（`plan_insert.cpp:59`）
 
 满足以下全部条件时返回 `true`：
 
