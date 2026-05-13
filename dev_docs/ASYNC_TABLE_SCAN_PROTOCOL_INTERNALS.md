@@ -185,12 +185,12 @@ sequenceDiagram
     loop 每个 async_task
         AR->>TS: ScheduleTask(executor.GetToken(),<br/>AsyncExecutionTask(executor,task,is,counter))
     end
-    AR-->>PTS: （tasks 已清空，result_type→INVALID）
+    AR-->>PTS: （各 task 已 move 进 AsyncExecutionTask，<br/>async_tasks 仍非空但内容为 moved-from；<br/>result_type 仍为 BLOCKED，AsyncResult 不应再使用）
     PTS-->>PE: SourceResultType::BLOCKED
     PE-->>PT: PipelineExecuteResult::INTERRUPTED
     PT-->>PT: return TASK_BLOCKED<br/>（不调用 event->FinishTask()）
 
-    Note over PT: PipelineTask 进入"已阻塞"状态，<br/>Deschedule() 已在 Execute 返回前调用
+    Note over PT: PipelineTask::ExecuteTask 返回 TASK_BLOCKED 给调度器；<br/>调度器随后调用 task->Deschedule()（task_scheduler.cpp:321）。<br/>若 Callback() 在 Deschedule() 记录前已触发，<br/>RescheduleTask 自旋等待直到 to_be_rescheduled_tasks 中出现该 task<br/>（executor.cpp:495-511）。
 
     loop 每个 AsyncExecutionTask（并发，可在任意 worker 线程）
         TS-->>AET: 调度执行
@@ -217,7 +217,7 @@ sequenceDiagram
 
 **链路 1：`ScheduleTask` → `AsyncExecutionTask::ExecuteTask`**
 
-`ScheduleTasks`（`async_result.cpp:86`）通过 `TaskScheduler::GetScheduler(executor.context).ScheduleTask(executor.GetToken(), task)` 把每个 `AsyncExecutionTask` 推入调度队列（`task_scheduler.cpp:258`），其中 `task` 类型为 `shared_ptr<AsyncExecutionTask>`。任意空闲 worker thread 在 `ExecuteForever` 循环中 dequeue 后立即执行 `task->Execute()`，后者调用 `ExecuteTask(mode)`.
+`ScheduleTasks`（`async_result.cpp:86`）通过 `TaskScheduler::GetScheduler(executor.context).ScheduleTask(executor.GetToken(), std::move(task))` 把每个 `AsyncExecutionTask` 推入调度队列（`task_scheduler.cpp:258`），其中每个 async task 被包裹进一个以 `make_uniq<AsyncExecutionTask>(...)` 创建的 `unique_ptr<AsyncExecutionTask>`，在调用 `ScheduleTask` 时转换为 `shared_ptr<Task>`（转换发生在调用点）。任意空闲 worker thread 在 `ExecuteForever` 循环中 dequeue 后立即执行 `task->Execute()`，后者调用 `ExecuteTask(mode)`.
 
 **链路 2：`async_task->Execute()` 的执行语义**
 
@@ -259,6 +259,14 @@ task->Reschedule();
 → `scheduler.ScheduleTask(GetToken(), task_p)`（`executor.cpp:506`），将原 `PipelineTask`
 重新投入调度队列。此后某个 worker thread 再次 dequeue 并执行该 task，
 pipeline 从 `BLOCKED` 恢复继续扫描。
+
+**关键竞争窗口**：`PipelineTask::ExecuteTask` 返回 `TASK_BLOCKED` 给调度器
+（`task_scheduler.cpp:307`），调度器**随后**才调用 `task->Deschedule()`
+（`task_scheduler.cpp:321`），`Deschedule()` 将 task 注册进 `to_be_rescheduled_tasks`。
+如果某个 `AsyncExecutionTask` 在 `Deschedule()` 完成前就触发了 `Callback()`，
+则 `Reschedule()` → `RescheduleTask()` 会在 `executor_lock` 下自旋，直到
+`to_be_rescheduled_tasks` 中出现目标 task 后才完成重调度（`executor.cpp:495–511`）。
+这个自旋是有意设计的竞争安全机制，避免任务被永久"遗失"。
 
 **链路 5：重新调度后的执行上下文连续性**
 
@@ -342,10 +350,7 @@ AsyncResultType AsyncResult::GetResultType() const {
 - `result_type` 必须为 `BLOCKED`，否则抛出。
 - `async_tasks` 必须非空，否则抛出。
 
-调用后：`async_tasks` 被 `std::move` 进 `AsyncExecutionTask`，框架不再持有原 tasks；
-`result_type` 并不被重置（仍为 BLOCKED），但外部已不再读取（`GetDataInternal` 直接 `return`）。
-注意：`ScheduleTasks` 不改变 `result_type`，但此后 `HasTasks()` / `GetResultType()` 
-会因 `async_tasks.empty()` 而触发 assertion 失败（若继续调用）。
+调用后：`ScheduleTasks` 通过范围 for 循环依次 `std::move` 每个 `async_task` 进新建的 `AsyncExecutionTask`，但**不调用 `async_tasks.clear()`，也不修改 `result_type`**。循环结束后 `async_tasks` 向量大小不变，仍为非空，各元素均为 moved-from 状态的 null `unique_ptr`，因此 `async_tasks.empty()` 返回 `false`，`result_type` 仍为 `BLOCKED`。`AsyncResult` 对象在 `ScheduleTasks` 调用后不应再被使用——其中保存的任务已移走为占位符，继续操作没有意义。`GetDataInternal` 在调用 `ScheduleTasks` 后直接 `return SourceResultType::BLOCKED`，不再访问 `async_result`。
 
 ### 4.5 ExtractSourceResultType 的不变量
 
