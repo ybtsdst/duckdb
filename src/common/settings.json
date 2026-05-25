@@ -515,6 +515,14 @@
         "default_value": "false"
     },
     {
+        "name": "enable_pipeline_trace",
+        "description": "Enables pipeline trace logging: prints the pipeline graph and outputs a Chrome Trace JSON timing report to stderr on query completion",
+        "type": "BOOLEAN",
+        "scope": "local",
+        "struct": "EnablePipelineTraceSetting",
+        "custom_implementation": true
+    },
+    {
         "name": "enable_profiling",
         "description": "Enables profiling, and sets the output format (JSON, QUERY_TREE, QUERY_TREE_OPTIMIZER)",
         "type": "VARCHAR",
@@ -894,6 +902,22 @@
         "type": "ENUM<ThreadPinMode>",
         "scope": "global",
         "default_value": "auto"
+    },
+    {
+        "name": "pipeline_graph_output",
+        "description": "File path for pipeline graph output when enable_pipeline_trace is true (empty = stderr)",
+        "type": "VARCHAR",
+        "scope": "local",
+        "struct": "PipelineGraphOutputSetting",
+        "custom_implementation": true
+    },
+    {
+        "name": "pipeline_trace_output",
+        "description": "File path for Chrome Trace JSON output when enable_pipeline_trace is true (empty = stderr)",
+        "type": "VARCHAR",
+        "scope": "local",
+        "struct": "PipelineTraceOutputSetting",
+        "custom_implementation": true
     },
     {
         "name": "pivot_filter_threshold",

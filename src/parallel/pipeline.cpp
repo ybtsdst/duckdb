@@ -1,6 +1,9 @@
 #include "duckdb/parallel/pipeline.hpp"
 
+#include <thread>
+
 #include "duckdb/common/algorithm.hpp"
+#include "duckdb/common/chrono.hpp"
 #include "duckdb/common/printer.hpp"
 #include "duckdb/common/tree_renderer/text_tree_renderer.hpp"
 #include "duckdb/execution/executor.hpp"
@@ -30,7 +33,16 @@ const PipelineExecutor &PipelineTask::GetPipelineExecutor() const {
 	return *pipeline_executor;
 }
 
+static int64_t SteadyNowNs() {
+	return static_cast<int64_t>(duration_cast<nanoseconds>(steady_clock::now().time_since_epoch()).count());
+}
+
 TaskExecutionResult PipelineTask::ExecuteTask(TaskExecutionMode mode) {
+	if (task_start_ns < 0) {
+		task_start_ns = SteadyNowNs();
+		task_thread_hash = std::hash<std::thread::id> {}(std::this_thread::get_id());
+	}
+
 	if (!pipeline_executor) {
 		pipeline_executor = make_uniq<PipelineExecutor>(pipeline.GetClientContext(), pipeline);
 	}
@@ -60,6 +72,7 @@ TaskExecutionResult PipelineTask::ExecuteTask(TaskExecutionMode mode) {
 		}
 	}
 
+	pipeline.RecordTaskTiming(task_start_ns, SteadyNowNs(), task_thread_hash);
 	event->FinishTask();
 	pipeline_executor.reset();
 	return TaskExecutionResult::TASK_FINISHED;
@@ -71,6 +84,11 @@ Pipeline::Pipeline(Executor &executor_p)
 
 ClientContext &Pipeline::GetClientContext() {
 	return executor.context;
+}
+
+void Pipeline::RecordTaskTiming(int64_t start_ns, int64_t end_ns, uint64_t thread_hash) {
+	lock_guard<mutex> lock(task_timings_lock);
+	task_timings.push_back({start_ns, end_ns, thread_hash});
 }
 
 bool Pipeline::GetProgress(ProgressData &progress) {

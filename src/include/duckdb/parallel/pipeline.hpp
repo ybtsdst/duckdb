@@ -43,6 +43,15 @@ public:
 
 public:
 	TaskExecutionResult ExecuteTask(TaskExecutionMode mode) override;
+
+private:
+	//! Wall-clock start time of this task's first ExecuteTask invocation (-1 = not yet started).
+	//! Captured once even if the task yields and is rescheduled, so the recorded interval covers
+	//! the whole task lifetime including any blocked periods between Execute calls.
+	int64_t task_start_ns = -1;
+	//! std::hash of this->thread::id at the time of first ExecuteTask. Used as Chrome Trace tid
+	//! so each worker thread gets its own row in Perfetto.
+	uint64_t task_thread_hash = 0;
 };
 
 class PipelineBuildState {
@@ -76,6 +85,7 @@ class Pipeline : public enable_shared_from_this<Pipeline> {
 	friend class PipelineFinishEvent;
 	friend class PipelineBuildState;
 	friend class MetaPipeline;
+	friend class PipelineTracer;
 
 public:
 	explicit Pipeline(Executor &execution_context);
@@ -99,6 +109,22 @@ public:
 	string ToString() const;
 	void Print() const;
 	void PrintDependencies() const;
+
+	//! Per-PipelineTask timing record. One entry per parallel task that ran this pipeline,
+	//! capturing first-Execute-entry → TASK_FINISHED return wall-clock interval and the
+	//! worker thread's hash.
+	struct TaskTiming {
+		int64_t start_ns;
+		int64_t end_ns;
+		uint64_t thread_hash;
+	};
+
+	//! Append a task timing record. Thread-safe; called by PipelineTask on completion.
+	void RecordTaskTiming(int64_t start_ns, int64_t end_ns, uint64_t thread_hash);
+
+	idx_t GetPipelineId() const {
+		return pipeline_id;
+	}
 
 	//! Returns query progress
 	bool GetProgress(ProgressData &progress_data);
@@ -132,6 +158,13 @@ private:
 	atomic<bool> initialized;
 	//! The source of this pipeline
 	optional_ptr<PhysicalOperator> source;
+
+	//! Pipeline ID assigned by PipelineTracer::AssignIds (0-based)
+	idx_t pipeline_id = 0;
+	//! Per-task timing records. Appended to from worker threads via RecordTaskTiming under
+	//! task_timings_lock; read once at query end by PipelineTracer::PrintChromeTrace.
+	mutable mutex task_timings_lock;
+	vector<TaskTiming> task_timings;
 	//! The chain of intermediate operators
 	vector<reference<PhysicalOperator>> operators;
 	//! The sink (i.e. destination) for data; this is e.g. a hash table to-be-built

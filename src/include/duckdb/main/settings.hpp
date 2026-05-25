@@ -780,6 +780,40 @@ struct EnableObjectCacheSetting {
 	static constexpr idx_t SettingIndex = 42;
 };
 
+struct EnablePipelineTraceSetting {
+	using RETURN_TYPE = bool;
+	static constexpr const char *Name = "enable_pipeline_trace";
+	static constexpr const char *Description =
+	    "Enables pipeline trace logging: prints the pipeline graph and outputs a Chrome Trace JSON "
+	    "timing report to stderr on query completion";
+	static constexpr const char *InputType = "BOOLEAN";
+	static void SetLocal(ClientContext &context, const Value &parameter);
+	static void ResetLocal(ClientContext &context);
+	static Value GetSetting(const ClientContext &context);
+};
+
+struct PipelineGraphOutputSetting {
+	using RETURN_TYPE = string;
+	static constexpr const char *Name = "pipeline_graph_output";
+	static constexpr const char *Description =
+	    "File path for pipeline graph output when enable_pipeline_trace is true (empty = stderr)";
+	static constexpr const char *InputType = "VARCHAR";
+	static void SetLocal(ClientContext &context, const Value &parameter);
+	static void ResetLocal(ClientContext &context);
+	static Value GetSetting(const ClientContext &context);
+};
+
+struct PipelineTraceOutputSetting {
+	using RETURN_TYPE = string;
+	static constexpr const char *Name = "pipeline_trace_output";
+	static constexpr const char *Description =
+	    "File path for Chrome Trace JSON output when enable_pipeline_trace is true (empty = stderr)";
+	static constexpr const char *InputType = "VARCHAR";
+	static void SetLocal(ClientContext &context, const Value &parameter);
+	static void ResetLocal(ClientContext &context);
+	static Value GetSetting(const ClientContext &context);
+};
+
 struct EnableProfilingSetting {
 	using RETURN_TYPE = string;
 	static constexpr const char *Name = "enable_profiling";

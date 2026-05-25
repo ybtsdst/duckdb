@@ -10,6 +10,7 @@ add_library_unity(
   interrupt.cpp
   pipeline.cpp
   pipeline_complete_event.cpp
+  pipeline_tracer.cpp
   pipeline_event.cpp
   pipeline_executor.cpp
   pipeline_finish_event.cpp

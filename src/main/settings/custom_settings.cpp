@@ -1206,6 +1206,54 @@ Value EnableHTTPLoggingSetting::GetSetting(const ClientContext &context) {
 }
 
 //===----------------------------------------------------------------------===//
+// Enable Pipeline Trace
+//===----------------------------------------------------------------------===//
+
+void EnablePipelineTraceSetting::SetLocal(ClientContext &context, const Value &input) {
+	ClientConfig::GetConfig(context).enable_pipeline_trace = input.GetValue<bool>();
+}
+
+void EnablePipelineTraceSetting::ResetLocal(ClientContext &context) {
+	ClientConfig::GetConfig(context).enable_pipeline_trace = ClientConfig().enable_pipeline_trace;
+}
+
+Value EnablePipelineTraceSetting::GetSetting(const ClientContext &context) {
+	return Value::BOOLEAN(ClientConfig::GetConfig(context).enable_pipeline_trace);
+}
+
+//===----------------------------------------------------------------------===//
+// Pipeline Graph Output
+//===----------------------------------------------------------------------===//
+
+void PipelineGraphOutputSetting::SetLocal(ClientContext &context, const Value &input) {
+	ClientConfig::GetConfig(context).pipeline_graph_output = input.GetValue<string>();
+}
+
+void PipelineGraphOutputSetting::ResetLocal(ClientContext &context) {
+	ClientConfig::GetConfig(context).pipeline_graph_output = ClientConfig().pipeline_graph_output;
+}
+
+Value PipelineGraphOutputSetting::GetSetting(const ClientContext &context) {
+	return Value(ClientConfig::GetConfig(context).pipeline_graph_output);
+}
+
+//===----------------------------------------------------------------------===//
+// Pipeline Trace Output
+//===----------------------------------------------------------------------===//
+
+void PipelineTraceOutputSetting::SetLocal(ClientContext &context, const Value &input) {
+	ClientConfig::GetConfig(context).pipeline_trace_output = input.GetValue<string>();
+}
+
+void PipelineTraceOutputSetting::ResetLocal(ClientContext &context) {
+	ClientConfig::GetConfig(context).pipeline_trace_output = ClientConfig().pipeline_trace_output;
+}
+
+Value PipelineTraceOutputSetting::GetSetting(const ClientContext &context) {
+	return Value(ClientConfig::GetConfig(context).pipeline_trace_output);
+}
+
+//===----------------------------------------------------------------------===//
 // Enable Mbedtls
 //===----------------------------------------------------------------------===//
 
