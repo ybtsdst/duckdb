@@ -126,7 +126,7 @@ public:
 | `StructExtractFilter` | 5 | 静态 | 结构体子列过滤 |
 | `OptionalFilter` | 6 | 动态 | 可选过滤，只用于 zonemap 剪枝，不保证正确性 |
 | `InFilter` | 7 | 动态 | `col IN (v1, v2, ...)`（build 侧数据量较小时） |
-| `DynamicFilter` | 8 | 动态 | 运行时可更新的过滤器（基础类型） |
+| `DynamicFilter` | 8 | 动态 | 运行时可更新的占位过滤器，值由执行期算子原地更新；详见 §10 |
 | `ExpressionFilter` | 9 | 静态 | 任意表达式 |
 | `BFTableFilter` | 10 | 动态 | 概率 Bloom Filter（build 侧数据量较大时） |
 
@@ -499,3 +499,102 @@ TableFunction GetMyTableFunction() {
 | `src/execution/operator/scan/physical_table_scan.cpp` | `GetGlobalSourceState`，读取并合并过滤器，调用 `init_global` |
 | `src/planner/table_filter.cpp` | `DynamicTableFilterSet` 实现 |
 | `src/include/duckdb/planner/operator/logical_get.hpp` | `LogicalGet::dynamic_filters`、`table_filters` |
+| `src/planner/filter/dynamic_filter.cpp` | `DynamicFilter` / `DynamicFilterData` 实现 |
+| `src/optimizer/topn_optimizer.cpp` | `TopN::PushdownDynamicFilters`，Top-N 动态过滤器下推 |
+| `src/execution/operator/order/physical_top_n.cpp` | `TopNBoundaryValue::UpdateValue`，执行期更新边界值 |
+
+---
+
+## 10. `DynamicFilter` 类型本身与 Top-N 下推
+
+前面 §2~§9 描述的是 **Join runtime filter** 路径：桥梁是 `DynamicTableFilterSet`，运行期被
+`PushFilter` 进去的是具体的 `ConstantFilter` / `InFilter` / `BFTableFilter`——**并不是
+`TableFilterType::DYNAMIC_FILTER`（枚举值 8）这个类型本身**。
+
+`DynamicFilter` 类型真正的构造点在 Top-N 优化器。本节单独说明这个类型的机制，以及它的主用例
+Top-N 下推。
+
+### 10.1 `DynamicFilter` 与 `DynamicFilterData`（类型机制）
+
+`DynamicFilter`（`src/include/duckdb/planner/filter/dynamic_filter.hpp`）是一个 `TableFilter`
+子类，本身几乎不持有状态，只持有一个 `shared_ptr<DynamicFilterData>`——真正的比较值在执行期
+才被填进去。计划期下推的是这个稳定的占位句柄，执行期算子通过共享指针更新它。
+
+```cpp
+struct DynamicFilterData {
+    mutex lock;
+    unique_ptr<ConstantFilter> filter;   // 真正干活的常量过滤器
+    atomic<bool> initialized = {false};  // 值是否已填好
+
+    void SetValue(Value val);            // 原地更新 filter->constant，置 initialized=true
+    void Reset();                        // 置 initialized=false
+};
+
+class DynamicFilter : public TableFilter {
+    shared_ptr<DynamicFilterData> filter_data;  // 与生产者算子共享同一份
+};
+```
+
+生命周期：
+
+- `SetValue(val)`：加锁，把 `val` 写入内层 `ConstantFilter::constant`，置 `initialized=true`。
+  对 `NULL` 值直接忽略（不更新）。
+- `Reset()`：置回 `initialized=false`（多次执行场景下复位）。
+
+关键方法（`src/planner/filter/dynamic_filter.cpp`）：
+
+| 方法 | 未初始化时 | 已初始化时 |
+|---|---|---|
+| `CheckStatistics` | 返回 `NO_PRUNING_POSSIBLE`（等于不裁剪、全扫） | 转发给内层 `ConstantFilter::CheckStatistics` |
+| `ToExpression` | 返回常量 `true`（过滤器空转） | 内层 `ConstantFilter` 的表达式 |
+| `Equals` | 按 `filter_data` 指针比较 | 同左 |
+| `Copy` | 共享同一个 `filter_data`（浅拷贝句柄，不复制值） | 同左 |
+
+线程安全由 `DynamicFilterData::lock`（更新/读取内层过滤器）+ `atomic<bool> initialized`
+（无锁快速判定）共同保证：生产者算子写值、多个扫描线程读值，互不冲突。
+
+### 10.2 与 `ConstantFilter` / `DynamicTableFilterSet` 的区别
+
+三者容易混淆，对比如下：
+
+| 概念 | 是什么 | 值的确定时机 | 谁来写值 |
+|---|---|---|---|
+| `ConstantFilter` | 单个过滤器，`col OP C` | 规划期定死 | 优化器 |
+| `DynamicTableFilterSet` | 过滤器**集合容器**（§3.1），Join 路径的共享桥梁 | 执行期 | Hash Join Build `Finalize` 调 `PushFilter`，推入的是具体 `ConstantFilter`/`InFilter`/`BFTableFilter` |
+| `DynamicFilter`（枚举 8） | **单个**占位过滤器，自身在规划期就下推固定 | 执行期 | 执行期算子调 `DynamicFilterData::SetValue`，原地更新内层 `ConstantFilter` 的值 |
+
+要点：Join 下推的产物**不是** `DynamicFilter` 类型；`DynamicFilter` 是一个「过滤器结构固定、只有
+内部常量值会变」的轻量占位符，主用例是 Top-N。
+
+### 10.3 Top-N 下推（主用例）
+
+对 `ORDER BY col LIMIT N` 这类查询，Top-N 算子在执行中能算出「当前第 N 名的边界值」，把它通过
+`DynamicFilter` 喂给下层表扫描，让扫描端提前裁掉 stats 上不可能进入前 N 的 row group。
+
+**优化器侧** —— `TopN::PushdownDynamicFilters`（`src/optimizer/topn_optimizer.cpp:67`）：
+
+- 触发条件：`ORDER BY` 首列是整型或 `VARCHAR`，且为单列的 `BOUND_COLUMN_REF`（不支持表达式）。
+- 比较方向：
+  - 升序（取最小 N 个）→ `C <= boundary`；只有单个 `ORDER BY` 列时可收紧为 `C < boundary`。
+  - 降序（取最大 N 个）→ `C >= boundary`；单列时收紧为 `C > boundary`。
+- 建一个 `DynamicFilterData` + 占位 `ConstantFilter`（初值用 `Value::MinimumValue` / 空串 `""`），
+  写入 `LogicalTopN::dynamic_filter`。
+- 对每个下推目标 `LogicalGet`，包一个 `DynamicFilter(filter_data)`；若 `NULLS FIRST`，再套一层
+  `ConjunctionOrFilter(IsNullFilter, DynamicFilter)`；最外层统一套 `OptionalFilter`，
+  最后 `get.table_filters.PushFilter(...)` 推进表扫描。
+
+**执行期侧** —— `physical_top_n.cpp` 的 `TopNBoundaryValue::UpdateValue`：
+
+- Top-N 算子维护一个大小为 N 的堆；处理输入时不断算出当前第 N 名的边界值。
+- 边界**单调收紧**时（新边界比旧的更优），调用 `op.dynamic_filter->SetValue(...)` 更新动态过滤器。
+- 扫描端随后对每个 row group 调 `DynamicFilter::CheckStatistics`，边界越紧、裁剪越激进。
+
+**正确性边界**：下推的 `DynamicFilter` 最外层是 `OptionalFilter` → 它**只用于 zonemap 剪枝、不保证
+正确性**（参见 §8 中 `OPTIONAL_FILTER` 的说明）。Top-N 的精确语义仍由算子自身的堆保证；动态过滤器
+纯粹是「锦上添花」的 I/O 优化，即使完全不生效（如一直未 `initialized`）结果也正确。
+
+### 10.4 一句话总结
+
+`TableFilterType::DYNAMIC_FILTER` = 一个**值由执行期算子（主要是 Top-N）动态填入、跨线程共享、
+惰性初始化**的占位 `TableFilter`：规划期下推固定的句柄，执行期原地更新内层 `ConstantFilter` 的值，
+未填值时等价于「不裁剪」，从而在不影响正确性的前提下随执行推进逐步收紧 row group 剪枝。
