@@ -28,7 +28,8 @@
         "llvm-vs-code-extensions.vscode-clangd",
         "eamodio.gitlens",
         "Anthropic.claude-code",
-        "vadimcn.vscode-lldb"
+        "vadimcn.vscode-lldb",
+        "bierner.markdown-mermaid"
       ]
     }
   },
