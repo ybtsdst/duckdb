@@ -2,7 +2,7 @@
 
 ## 基线与阅读方式
 
-本目录的25篇专题文档面向当前研究分支 `v2.0-cyanoptera`，源码核对基线为：
+本目录的26篇专题文档面向当前研究分支 `v2.0-cyanoptera`。首批25篇的源码核对基线为：
 
 ```text
 c1cd2470a455635c6662029a2c44656f7b46ee61
@@ -10,15 +10,17 @@ c1cd2470a455635c6662029a2c44656f7b46ee61
 
 核对日期：2026-10-23。此标识固定的是被分析的源码，不是以后文档提交的 HEAD，也不是对所有 DuckDB 2.0 发行版本的泛化保证。
 
+新增[异步 I/O 总体设计](ASYNC_IO_DESIGN.md)核对于 `6fdf17af20e21f4cc1b2008ebe58147a12dac7e3`（2026-10-23）；该提交相对上述基线仅修改文档，分析的源码内容相同。各篇保留自己的核对基线，不将文档提交当成源码机制变化。
+
 审查方式为全文阅读文档并追踪当前声明、实现和调用方。正文区分源码事实、说明性骨架和有条件的机制推断；本轮没有编译扩展示例、执行 SQL/测试、启动服务或进行性能测量。源码摘录和伪代码均按各节说明阅读，不能把省略类型、状态或恢复处理的骨架直接当作完整实现。
 
 文中源码链接优先指向仓库内的实际文件并给出符号名，避免依赖已漂移的行号。字段、条件和调用链与未来分支发生变化时，应重新核对。没有展开的机制和运行验证边界在各篇末尾注明。
 
 ## 文档清单与逐篇审查记录
 
-以下列出全部25篇文档的修订重点及对应源码入口；验收范围见本页末尾。
+以下列出全部26篇文档的修订重点及对应源码入口；验收范围见本页末尾。
 
-### 执行与扫描框架（5篇）
+### 执行、扫描与异步 I/O（6篇）
 
 | 文档 | 本轮重点修订 | 核心源码定位 |
 |---|---|---|
@@ -27,6 +29,7 @@ c1cd2470a455635c6662029a2c44656f7b46ee61
 | [TableFunction 接口](TABLE_FUNCTION_DESIGN.md) | Base/Bound拆分、当前回调和默认值、初始化与重用、列映射、异步输入和接口边界 | [table_function.hpp](../src/include/duckdb/function/table_function.hpp)；[physical_table_scan.cpp](../src/execution/operator/scan/physical_table_scan.cpp)：GetDataInternal |
 | [异步扫描](ASYNC_TABLE_SCAN_DESIGN.md) | mode与并行度分离、结果/块大小约束、合法结果类型转换、携任务与taskless BLOCKED | [async_result.hpp](../src/include/duckdb/parallel/async_result.hpp)；[table_function.cpp](../src/function/table_function.cpp)：HandleBlocked |
 | [异步协议内部实现](ASYNC_TABLE_SCAN_PROTOCOL_INTERNALS.md) | 完成批次、唤醒顺序、错误发布、同步降级、辅助TaskExecutor及CancelAndDrain寿命 | [async_result.cpp](../src/parallel/async_result.cpp)；[scan_read_ahead.cpp](../src/parallel/scan_read_ahead.cpp)；[task_executor.cpp](../src/parallel/task_executor.cpp) |
+| [异步 I/O 总体设计](ASYNC_IO_DESIGN.md) | 新增读写全链路：双池调度、读取/解码分离、缓存嵌套任务、三种写模式、预算背压与失败收尾 | [scan_read_ahead.cpp](../src/parallel/scan_read_ahead.cpp)；[async_file_writer.cpp](../src/common/serializer/async_file_writer.cpp)；[async_write_queue.cpp](../src/common/serializer/async_write_queue.cpp) |
 
 ### 表达式与查询优化（10篇）
 
@@ -74,12 +77,12 @@ c1cd2470a455635c6662029a2c44656f7b46ee61
 
 ## 静态验收记录
 
-本轮完成25/25篇专题文档的全文审查与修订，并对日志、profiling、runtime filter、延迟物化的重点控制流进行了独立交叉复核。逐篇修订重点和源码依据见上表，各篇正文保留具体符号、条件和未展开的边界。
+首批完成25/25篇专题文档的全文审查与修订，并对日志、profiling、runtime filter、延迟物化的重点控制流进行了独立交叉复核；已提交为 `6fdf17af20e`。异步 I/O 增补覆盖公共框架、原生表、multi-file、Parquet、CSV/COPY及写队列的声明、实现和调用方。逐篇重点和源码依据见上表，各篇正文保留具体符号、条件和未展开的边界。
 
-- 25篇正文均标注相同的源码基线、核对日期和静态审查范围。
-- 全部26份Markdown（25篇正文与本索引）的代码围栏闭合、正文相对链接目标存在；本索引覆盖全部25篇。
-- `git diff --check -- dev_docs` 无空白错误；新增索引另行检查行尾空白。
-- 源码HEAD保持上述基线；原有 `.vscode/tasks.json` 修改的文件内容与本轮开始时一致。本轮仅修改 `dev_docs`，未提交或推送。
+- 26篇正文均标注源码基线、核对日期和静态审查范围；首批与增补基线的关系见本页开头。
+- 全部27份Markdown（26篇正文与本索引）的代码围栏闭合、正文相对链接目标存在；本索引覆盖全部26篇。
+- `git diff --check -- dev_docs` 无空白错误；未跟踪的新增正文另行检查行尾空白。
+- 异步 I/O 增补阶段HEAD保持 `6fdf17af20e`；原有 `.vscode/tasks.json` 修改的文件内容与增补开始时一致。增补仅新增异步 I/O 正文并更新本索引，尚未提交或推送。
 
 这些检查验证文档结构、引用目标和修改范围。它们不证明每个示例可以编译或运行，也不替代并发、恢复和性能验证；本轮未执行这些任务。
 
