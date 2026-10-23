@@ -1,387 +1,156 @@
 # DuckDB 事务实现机制与 MVCC 设计文档
 
+> 适用源码：`v2.0-cyanoptera` @ `c1cd2470a455`；核对日期：2026-10-23。核对方式：静态源码审查，未执行本文示例或性能测试。
+
 ## 概述
 
-本文档整理 DuckDB 的事务实现机制，说明 ACID 四个属性分别如何保证，重点分析基于 MVCC（Multi-Version Concurrency Control，多版本并发控制）的隔离性实现。
+内置 DuckDB 事务使用快照可见性、Undo、本地追加存储、索引约束和 WAL/checkpoint 协作。当前实现以 `SnapshotView` 和 `VisibilityBound` 表达可见性，并支持与追加/删除并发的 checkpoint；不能沿用“所有写操作只改 LocalStorage”“checkpoint 时没有活跃事务”的模型。
 
----
+## 一、ACID 的组成与边界
 
-## 一、ACID 总览
+| 属性 | 主要机制 |
+|---|---|
+| 原子性 | LocalStorage 回滚、UndoBuffer 逆序撤销、失败提交的 RevertCommit |
+| 一致性 | 表约束、索引、Catalog/依赖提交检查；不自动表达应用的全部业务约束 |
+| 隔离性 | SnapshotView + 行插入/删除版本、列更新 Undo 链、Catalog 版本链 |
+| 持久性 | 符合条件的 WAL 同步，或自动 checkpoint 替代 WAL 的分支 |
 
-| 属性 | 保证机制 |
-|------|---------|
-| **原子性（Atomicity）** | `UndoBuffer` — 所有变更统一记录，Rollback 时逆向撤销 |
-| **一致性（Consistency）** | 约束检查（主键/外键/唯一索引） + `DependencyManager` 依赖关系验证 |
-| **隔离性（Isolation）** | MVCC 快照隔离（Snapshot Isolation）— `ChunkInfo` / `RowVersionManager` / `UpdateInfo` 版本链 |
-| **持久性（Durability）** | Write-Ahead Log（WAL）— 提交前先写日志，崩溃后可重放恢复 |
+这是机制划分，不是对所有扩展、外部系统、文件系统故障的无条件保证。内存库、临时库、恢复模式与自定义 TransactionManager 有各自边界。
 
----
+## 二、事务对象与统一可见性
 
-## 二、关键数据结构与源码位置
+[duck_transaction.hpp](../src/include/duckdb/transaction/duck_transaction.hpp) 的 `DuckTransaction` 保存 start_time、`SnapshotView view`、commit_id、catalog_version、UndoBuffer、LocalStorage，以及 checkpoint/vacuum/table 锁；不再有旧文档中的直接 transaction_id、highest_active_query 字段或名为 write_lock 的共享锁字段。
 
-### 2.1 事务对象
-
-**`DuckTransaction`**（`src/include/duckdb/transaction/duck_transaction.hpp`）
+[transaction_data.hpp](../src/include/duckdb/transaction/transaction_data.hpp) 的真实源码摘录：
 
 ```cpp
-class DuckTransaction : public Transaction {
-public:
-    transaction_t start_time;        // 事务开始时的全局时间戳（用于快照读）
-    transaction_t transaction_id;    // 事务唯一 ID（>= TRANSACTION_ID_START ≈ 2^62）
-    transaction_t commit_id;         // 提交后赋值的提交时间戳
-    transaction_t highest_active_query; // 用于 GC 判断
-
-private:
-    UndoBuffer undo_buffer;          // 存储旧版本数据（供回滚和可见性判断使用）
-    unique_ptr<LocalStorage> storage; // 事务本地未提交数据
-    unique_ptr<StorageLockKey> write_lock; // 持有共享 Checkpoint 锁
-};
-```
-
-**`DuckTransactionManager`**（`src/include/duckdb/transaction/duck_transaction_manager.hpp`）
-
-```cpp
-class DuckTransactionManager : public TransactionManager {
-    transaction_t current_start_timestamp;  // 自增，为每个新事务分配 start_time（从 2 开始）
-    transaction_t current_transaction_id;   // 自增，为每个新事务分配 transaction_id（从 TRANSACTION_ID_START 开始）
-    atomic<transaction_t> lowest_active_id;   // 当前最低活跃事务 ID（用于 GC）
-    atomic<transaction_t> lowest_active_start; // 当前最低活跃 start_time（用于 GC）
-
-    vector<unique_ptr<DuckTransaction>> active_transactions;            // 当前活跃事务
-    vector<unique_ptr<DuckTransaction>> recently_committed_transactions; // 最近提交的事务（等待 GC）
-    vector<unique_ptr<DuckTransaction>> old_transactions;               // 待 GC 的旧事务
-
-    mutex transaction_lock;         // 保护活跃事务列表
-    mutex start_transaction_lock;   // 串行化读写事务的开启
-    StorageLock checkpoint_lock;    // 协调事务与 Checkpoint
-};
-```
-
-**时间戳语义关键设计**：
-- `start_time` 从 2 开始单调递增（普通时间戳域）
-- `transaction_id` 从 `TRANSACTION_ID_START`（约 2^62）开始单调递增
-
-这一设计保证：若某个版本号 `id < TRANSACTION_ID_START`，则它一定是已提交的 commit_id；若 `id >= TRANSACTION_ID_START`，则它是某个活跃事务的 transaction_id（未提交）。
-
----
-
-### 2.2 行版本信息（MVCC 核心）
-
-DuckDB 存储层以 **RowGroup → Vector（每向量 STANDARD_VECTOR_SIZE = 2048 行）** 为单位组织数据。每个 Vector 的行可见性由 `ChunkInfo` 管理。
-
-**`ChunkInfo` 继承体系**（`src/include/duckdb/storage/table/chunk_info.hpp`）：
-
-```
-ChunkInfo（抽象基类）
-├── ChunkConstantInfo   // 整个 Vector 所有行的 insert_id / delete_id 相同（批量插入常见）
-└── ChunkVectorInfo     // 每行独立记录 inserted[i] 和 deleted[i]
-```
-
-```cpp
-class ChunkConstantInfo : public ChunkInfo {
-    transaction_t insert_id;    // 该 Vector 所有行的插入版本号
-    transaction_t delete_id;    // 该 Vector 所有行的删除版本号（NOT_DELETED_ID 表示未删除）
-};
-
-class ChunkVectorInfo : public ChunkInfo {
-    transaction_t inserted[STANDARD_VECTOR_SIZE]; // 每行的插入版本号
-    transaction_t deleted[STANDARD_VECTOR_SIZE];  // 每行的删除版本号
-    transaction_t insert_id;     // 快速路径：所有行 insert_id 相同时的缓存值
-    bool same_inserted_id;       // 标记是否所有行 insert_id 一致
-    bool any_deleted;            // 标记是否有任何行被删除
-};
-```
-
-**`RowVersionManager`** （`src/include/duckdb/storage/table/row_version_manager.hpp`）：管理一个 RowGroup 内所有 Vector 的版本信息。
-
----
-
-### 2.3 更新版本链（Update Chain）
-
-UPDATE 操作不直接修改原始数据，而是通过版本链保存历史值。
-
-**`UpdateInfo`**（`src/include/duckdb/transaction/update_info.hpp`）：
-
-```cpp
-struct UpdateInfo {
-    UpdateSegment *segment;       // 所属的 UpdateSegment
-    DataTable *table;             // 所属表
-    idx_t column_index;           // 修改的列
-    atomic<transaction_t> version_number; // 该版本的事务 ID（未提交）或 commit_id（已提交）
-    idx_t vector_index;           // 在 segment 内的 Vector 索引
-    sel_t N;                      // 本条目更新的行数
-    UndoBufferPointer prev;       // 指向更老版本（undo buffer 中）
-    UndoBufferPointer next;       // 指向更新版本（undo buffer 中）
-    // 紧随其后的内存：[sel_t rows[max]][T values[max]]
-};
-```
-
-版本链遍历逻辑（`UpdateInfo::UpdatesForTransaction`）：
-
-```cpp
-// 从最新版本向旧版本遍历，找到对当前事务可见的版本集合
-bool AppliesToTransaction(transaction_t start_time, transaction_t transaction_id) {
-    // version_number > start_time 表示该更新发生在本事务开始之后（不可见）
-    // version_number == transaction_id 表示该更新是本事务自己做的（也需要应用）
-    return version_number > start_time && version_number != transaction_id;
+bool Sees(transaction_t timestamp) const {
+    return timestamp < visibility_bound || timestamp == transaction_id;
 }
 ```
 
----
+[constants.hpp](../src/include/duckdb/common/constants.hpp) 定义 `VisibilityBound::Before(t)` 为排他 `< t`，`Through(t)` 为 `< t+1`；只提供 timestamp 与 bound 的 `<`、`>=` 比较，避免错误混用包含/排除边界。
 
-### 2.4 Undo Buffer
+[constants.cpp](../src/common/constants.cpp) 中 `SYSTEM_TRANSACTION_TIMESTAMP=1`、`TRANSACTION_ID_START=4611686018427388000ULL`、`MAX_COMMIT_ID=TRANSACTION_ID_START-1`。应以常量定义为准，不用约数 2^62 替代精确值。`IsCommitted(t)` 实际判断 `t <= MAX_COMMIT_ID`；未删除 sentinel 等特殊值不应直接当成某个活跃事务。
 
-**`UndoBuffer`**（`src/include/duckdb/transaction/undo_buffer.hpp`）：每个 `DuckTransaction` 独占一个 `UndoBuffer`，按顺序记录该事务所做的所有变更，用于回滚和版本可见性。
+普通事务由 [DuckTransactionManager::StartTransaction](../src/transaction/duck_transaction_manager.cpp) 创建：分配单调 start_time 和 transaction_id，view 为 `SnapshotView(id, Before(start_time))`。Catalog 提交校验和 checkpoint 可构造其他 view，所以通用规则必须使用 view，而非硬编码 start_time。
 
-Undo Buffer 内存布局（按写入顺序线性存放）：
+## 三、行插入/删除版本：ChunkVectorInfo
 
-```
-[UndoFlags (4B)][Length (4B)][Entry Data ...]
-[UndoFlags (4B)][Length (4B)][Entry Data ...]
-...
-```
+当前 [chunk_info.hpp](../src/include/duckdb/storage/table/chunk_info.hpp) **内存中只有 ChunkVectorInfo**。`CONSTANT_INFO`、`EMPTY_INFO` 是序列化 tag，不再存在旧版 ChunkInfo→ChunkConstantInfo/ChunkVectorInfo 的内存继承体系。
 
-Entry 类型（`src/include/duckdb/common/enums/undo_flags.hpp`）：
+`RowVersionManager` 管理行组各 vector 的版本对象。STANDARD_VECTOR_SIZE 来自构建常量（默认 2048），不能把固定 2048 当作所有二进制的保证。
 
-| UndoFlags | 对应结构 | 说明 |
-|-----------|---------|------|
-| `CATALOG_ENTRY` | `CatalogEntry *` | Catalog 对象变更（建表/删表/改表等） |
-| `INSERT_TUPLE` | `AppendInfo` | 追加行（记录 start_row + count） |
-| `DELETE_TUPLE` | `DeleteInfo` | 删除行 |
-| `UPDATE_TUPLE` | `UpdateInfo` | 更新列值（含版本链头指针） |
-| `SEQUENCE_VALUE` | `SequenceValue` | 序列值变更 |
-| `ATTACHED_DATABASE` | `AttachedDatabase *` | 附加数据库操作 |
+| 版本侧 | 内存表示 |
+|---|---|
+| 插入 | constant_insert_id 或分配器中的 per-row inserted_data |
+| 删除 CONSTANT | 全 vector 共用 constant_delete_id，未删除用 NOT_DELETED_ID |
+| 删除 MASKED | deleted_mask 指示删除行，mask_delete_id 保存共享的已提交删除版本 |
+| 删除 ARRAY | 分配器中每行独立删除版本 |
 
----
+MASKED 的 valid bit 表示“已删除”，方向不是“活行”；mask_delete_id 可是仍需快照区分的非零提交号，不能把 mask 等同于所有事务都已看到的删除。
 
-## 三、事务生命周期
+`CompressVersionIds(lowest_visibility_bound)` 只在对所有快照等价时压缩；FULLY_COMPRESSED/PENDING/SETTLED 与 recheck_compression 避免无效重复扫描。版本数组由 FixedSizeAllocator/IndexPointer 管理，不是对象内固定两组 2048 项数组。
 
-### 3.1 开始事务（StartTransaction）
+普通快照读取在 [chunk_info.cpp](../src/storage/table/chunk_info.cpp) 使用 `StandardInsertOperator` / `StandardDeleteOperator`：
 
-```
-1. 若为读写事务，获取 start_transaction_lock（防止 FORCE CHECKPOINT 期间新事务开启）
-2. 获取 transaction_lock
-3. 分配 start_time = current_start_timestamp++
-4. 分配 transaction_id = current_transaction_id++
-5. 若 active_transactions 为空，更新 lowest_active_start / lowest_active_id
-6. 创建 DuckTransaction（含空 UndoBuffer 和 LocalStorage）
-7. 加入 active_transactions
+```text
+visible(row) = view.Sees(insert_version) && !view.Sees(delete_version)
 ```
 
-### 3.2 执行期间
+这是正常事务扫描的规则示意；全行扫描、checkpoint 等 ScanOptions 使用不同 operator，不能将其套给全部内部扫描。
 
-所有写操作先作用于事务的 `LocalStorage`（内存中未提交数据），同时向 `UndoBuffer` 写入对应条目：
+## 四、UPDATE：最新值与 Undo 链
 
-- **INSERT**：追加到 LocalStorage 的本地 RowGroupCollection；调用 `PushAppend` 写 `INSERT_TUPLE` 到 Undo Buffer；在 `ChunkInfo` 中，该行的 `inserted[i] = transaction_id`（未提交标记）
-- **DELETE**：在 `ChunkVectorInfo::Delete` 中将 `deleted[row] = transaction_id`；调用 `PushDelete` 写 `DELETE_TUPLE` 到 Undo Buffer
-- **UPDATE**：在 `UpdateSegment` 中创建新的 `UpdateInfo`，`version_number = transaction_id`；调用 `CreateUpdateInfo` 写 `UPDATE_TUPLE` 到 Undo Buffer；原始数据保存在 UpdateInfo 链中
+[update_info.hpp](../src/include/duckdb/transaction/update_info.hpp) 中 `UpdateInfo` 保存 segment、DuckTableEntry、column_index、row_group_start、atomic version_number、vector_index、N、容量 max、prev/next UndoBufferPointer；其后连续存储 tuple IDs 与旧值，容量可紧凑分配，不总是固定 STANDARD_VECTOR_SIZE。
 
-**写写冲突检测**（乐观锁）：  
-删除时若发现 `deleted[row] != NOT_DELETED_ID`（即已被另一事务删除），立即抛出 `TransactionException("Conflict on tuple deletion!")`。更新时通过 `UpdateSegment` 中的独占锁防止并发更新同一 UpdateInfo。
+[update_segment.cpp](../src/storage/table/update_segment.cpp) 的 `UpdateSegment::Update/FetchUpdates` 维护更新段的当前值与各事务旧值：读取先取得 base/current 内容，再按 view 应用所需 Undo。不能描述为“UPDATE 不修改任何当前数据，只加一条新值链”。
 
-### 3.3 提交（Commit）
+`UpdateInfo::AppliesToTransaction(view)` 对 root 的 MAX_COMMIT_ID 哨兵返回 true，对普通节点返回 `!view.Sees(version_number)`。所以 callback 应用的是不可见更新的旧值；本事务自己的版本可见，不需要用该 Undo 撤销自己。`UpdatesForTransaction` 沿 next 遍历，不应把 prev/next 方向写反。
 
-```
-1. DuckTransactionManager::CommitTransaction()
-   a. 获取 transaction_lock
-   b. 调用 GetCommitTimestamp() 分配 commit_id（= current_start_timestamp++）
-   c. 调用 DuckTransaction::WriteToWAL() — 将 Undo Buffer 中的变更序列化到 WAL 文件
-   d. 调用 DuckTransaction::Commit(commit_id)
-      i.  storage->Commit() — 将 LocalStorage 的追加数据合并到全局 RowGroup
-      ii. undo_buffer.Commit(commit_id) — 遍历 Undo Buffer：
-          - INSERT_TUPLE：调用 ChunkInfo::CommitAppend(commit_id)，将 inserted[i] 由 transaction_id 改为 commit_id
-          - DELETE_TUPLE：调用 ChunkVectorInfo::CommitDelete(commit_id)，将 deleted[i] 由 transaction_id 改为 commit_id
-          - UPDATE_TUPLE：将 UpdateInfo::version_number 由 transaction_id 改为 commit_id
-          - CATALOG_ENTRY：将 CatalogEntry::timestamp 改为 commit_id
-      iii. 若有 WAL 写入，flush 到磁盘
-2. 从 active_transactions 移出，加入 recently_committed_transactions
-3. 更新 lowest_active_start / lowest_active_id
-4. 触发 GC（见 3.5）
-```
+普通列更新通过该路径；影响索引/特定语义的 UPDATE 计划可能改写成 DELETE+INSERT，不能把所有 UPDATE 都统一成删除插入。
 
-### 3.4 回滚（Rollback）
+## 五、执行期写入与冲突
 
-```
-1. storage->Rollback() — 丢弃 LocalStorage（所有未提交追加）
-2. undo_buffer.Rollback() — 逆序遍历 Undo Buffer：
-   - CATALOG_ENTRY：调用 CatalogSet::Undo() 恢复旧版本条目
-   - INSERT_TUPLE：调用 DataTable::RevertAppend() 撤销追加
-   - DELETE_TUPLE：调用 ChunkVectorInfo::CommitDelete(NOT_DELETED_ID) 恢复为"未删除"
-   - UPDATE_TUPLE：调用 UpdateSegment::RollbackUpdate() 恢复原始值
-3. 从 active_transactions 移出
-```
+- INSERT 通常写事务私有 LocalStorage 行组，允许 optimistic writer 提前写块。`PushAppend` 在 LocalStorage::Flush 将本地数据交入共享表后记录追加范围，不是每个 Sink chunk 到达时就统一记录全局 INSERT Undo。
+- 对共享表 DELETE 修改 RowVersionManager/ChunkVectorInfo 的删除版本并写 DeleteInfo；删除本事务本地行走本地存储分支。
+- 对共享列 UPDATE 创建 UpdateInfo 与 Undo 链；本地行更新由相应本地路径处理。
+- DDL 创建共享 Catalog 版本链节点，但通过 view 隔离未提交版本。
 
-### 3.5 清理（Cleanup / GC）
+`ChunkVectorInfo::Delete` 对本事务已删除的行跳过；另一事务已标记删除则冲突，包括 constant/array 分支。更新的 `CheckForConflicts` 会比较其他版本是否 `>= visibility_bound`，再检查 tuple ID 是否相交；独占锁只保护结构，冲突检测还拒绝快照之外已提交更新，绝非“有锁就不会写写冲突”。
 
-当一个已提交事务的数据对所有当前活跃事务都不再需要时（`commit_id < lowest_active_start`），可安全清理其 Undo Buffer：
+源码：[local_storage.cpp](../src/storage/local_storage.cpp)、[chunk_info.cpp](../src/storage/table/chunk_info.cpp) 的 `Delete`、[update_segment.cpp](../src/storage/table/update_segment.cpp) 的 `CheckForConflicts`、[catalog_set.cpp](../src/catalog/catalog_set.cpp) 的 `HasConflict`。
 
-```
-1. 满足清理条件的事务进入 old_transactions
-2. 异步执行 DuckTransaction::Cleanup(lowest_active_transaction)
-3. undo_buffer.Cleanup() 遍历：
-   - INSERT_TUPLE：调用 DataTable::CleanupAppend() 移除 ChunkConstantInfo（不再需要版本信息）
-   - DELETE_TUPLE：从 ART 索引中删除对应条目
-   - UPDATE_TUPLE：调用 UpdateSegment::CleanupUpdate() 从版本链中移除已无用的 UpdateInfo
-   - CATALOG_ENTRY：调用 CatalogSet::CleanupEntry() 删除旧版本的 CatalogEntry
+## 六、提交生命周期
+
+### 6.1 正常 WAL 分支
+
+以下为省略日志与异常细节的控制流示意，依据 [duck_transaction_manager.cpp](../src/transaction/duck_transaction_manager.cpp) 的 `CommitTransaction` 与 [duck_transaction.cpp](../src/transaction/duck_transaction.cpp)：
+
+```text
+PreFlushOptimisticBlocks（取得 commit 锁之前）
+  → bulk append 块 Flush + 必要的数据库 FileSync
+取得 transaction_lock，评估 checkpoint
+需要写 WAL？
+  释放 transaction_lock → 取得并保持 WAL lock
+  WriteToWAL
+    LocalStorage::Commit → 全局索引/表数据 + PushAppend
+    UndoBuffer::WriteToWAL
+  重新取得 transaction_lock
+分配 commit_id
+DuckTransaction::Commit
+  LocalStorage::Commit（之前已移走的本地项不会重复 flush）
+  UndoBuffer::Commit（可见性/约束/依赖检查与版本号发布）
+  commit_state.FlushCommit → WAL_FLUSH + writer.Sync
+  CommitDropState::FinalizeCommit
+移出 active_transactions → 排队/执行 Cleanup
+必要时 CreateCheckpoint
 ```
 
----
+不能写成“先 fsync WAL，再应用所有内存 commit”。当前代码先提交 Undo 版本，在 transaction_lock 保持期间 FlushCommit；失败再 RevertCommit。也不能写成“分配 commit_id 后才始终 WriteToWAL”：管理器的常规 WAL 准备发生在分配 commit_id 前。
 
-## 四、MVCC 可见性判断
+### 6.2 LocalStorage 如何转入共享存储
 
-### 4.1 核心可见性规则
+`LocalStorage::Flush` 对 bulk append，或空表且不可写盘、无本地删除的特定路径，先 FlushBlocks、AppendToIndexes，再 MergeStorage；其他路径撤销不适用的 optimistic blocks 后，AppendToIndexes、AppendToTable。最后 PushAppend。
 
-DuckDB 实现的是 **快照隔离（Snapshot Isolation）**：每个事务看到一个一致的数据快照，该快照对应事务开始时（`start_time`）已提交的所有数据。
+全局索引通过扫描数据追加，不是所有事务都直接 MergeIndexes。数据可能已转入共享结构但仍带本事务未提交版本，因此“共享物理位置”与“其他快照可见”不同。
 
-**`TransactionVersionOperator`**（`src/storage/table/chunk_info.cpp`）：
+### 6.3 无 WAL 与自动 checkpoint 分支
 
-```cpp
-struct TransactionVersionOperator {
-    // 判断一行是否对当前事务"可插入可见"（即该行的插入是可见的）
-    static bool UseInsertedVersion(transaction_t start_time, transaction_t transaction_id, transaction_t id) {
-        return id < start_time       // 该行在本事务开始前已提交（commit_id < start_time）
-            || id == transaction_id; // 该行是本事务自己插入的（尚未提交也可见）
-    }
+`ShouldWriteToWAL` 排除无修改、system、NO_WAL_WRITES、没有可写 WAL 的情形。自动 checkpoint 满足条件且变更估计达到 AutoCheckpointSkipWalThreshold 时，可选择跳过本事务 WAL，由 checkpoint 提供持久化；此时保持 WAL 锁阻止后续提交越过它。若重新评估不能 checkpoint，会补写 WAL。
 
-    // 判断一行的删除是否对当前事务可见（若删除可见，则该行对本事务不可见）
-    static bool UseDeletedVersion(transaction_t start_time, transaction_t transaction_id, transaction_t id) {
-        return !UseInsertedVersion(start_time, transaction_id, id);
-    }
-};
-```
+checkpoint 失败时，已写 WAL 的分支记录 autocheckpoint error；未写 WAL 的分支合并返回错误。不能简单归纳成“每次提交必 fsync WAL”或“所有 checkpoint 错误都代表原事务已撤销”。
 
-**一行对当前事务可见的完整条件**：
+## 七、失败回滚与延迟资源回收
 
-```
-visible = UseInsertedVersion(insert_id) && UseDeletedVersion(delete_id)
-         = (insert_id < start_time || insert_id == transaction_id)
-           && !(delete_id < start_time || delete_id == transaction_id)
-```
+`DuckTransaction::Commit` 捕获错误后逆序 `UndoBuffer::RevertCommit` 恢复未提交版本，commit_state 尝试撤回 WAL 写入；管理器再执行 Rollback。恢复过程本身失败会 invalidate 数据库，阻止继续假设状态一致。
 
-即：
-- 该行的**插入**发生在本事务快照之前（已提交），或者是本事务自己插入的；
-- 该行的**删除**对本事务不可见（删除发生在本事务开始之后，或尚未提交且不是本事务删除的）。
+`DuckTransaction::Rollback` 先 LocalStorage::Rollback，再 UndoBuffer::Rollback；后者在 [rollback_state.cpp](../src/transaction/rollback_state.cpp) 分别恢复 Catalog、RevertAppend、撤销删除和更新。已经进入共享表/索引的数据需要相应撤销，不能仅丢弃本地存储。
 
-### 4.2 UPDATE 的可见性（UpdateInfo 版本链）
+当前管理器维护 active_transactions、recently_committed_transactions 与 cleanup_queue，不再有旧文档的 old_transactions 列表。`UpdateLowestVisibilityBound` 计算所有活跃快照最小 bound；`SweepCommittedTransactions` 将 commit_id 小于该 bound 的保留事务移入 cleanup info。`CleanupTransactions` 在释放 transaction_lock 后，由 cleanup_lock 串行按队列处理，不能宣称每次 GC 都由独立异步线程执行。
 
-读取某行某列时，从列段（UpdateSegment）的最新 UpdateInfo 开始向旧版本遍历，找到所有对当前事务"应该应用"的更新：
+[cleanup_state.cpp](../src/transaction/cleanup_state.cpp) 清理 Catalog 旧 entry、追加版本信息、删除/更新 Undo；当前删除与索引 delta 的处理还涉及提交时移除及旧读者保留，不能把所有索引删除都推迟到 Cleanup。
 
-```cpp
-bool AppliesToTransaction(transaction_t start_time, transaction_t transaction_id) {
-    // version_number > start_time：该 UPDATE 在本事务快照之后发生 → 需要用旧值（跳过该更新，用链中更旧的版本）
-    // version_number == transaction_id：本事务自己做的更新 → 本事务可以看到自己的更新
-    return version_number > start_time && version_number != transaction_id;
-}
-```
+## 八、checkpoint 与锁的粒度
 
-实际语义：若 `AppliesToTransaction` 为 true，则该 UpdateInfo 存储的是"从该版本的值还原到更旧值所需的旧数据"（即 undo 数据），需要应用以得到本事务应看到的值。
+[DuckTransaction::SetModifications](../src/transaction/duck_transaction.cpp) 按修改类型申请锁：UpdateData/AlterTable/CreateCatalogEntry/DropCatalogEntry/Sequence/CreateIndex 需要共享 checkpoint 锁；InsertData/DeleteData 申请共享 vacuum 锁。它不是所有读写事务启动就统一持共享 checkpoint 锁。
 
-### 4.3 快照隔离的隔离级别分析
+| 锁 | 作用 |
+|---|---|
+| transaction_lock | 事务列表、时间戳、提交期间的协调；WAL 写入期间可暂时释放 |
+| WAL lock | 序列化相关提交与 WAL/checkpoint 切换 |
+| start_transaction_lock | FORCE CHECKPOINT 与事务开启协调 |
+| checkpoint/vacuum StorageLock | 阻止冲突修改或移动 rowid；两种锁职责不同 |
+| RowVersionManager / UpdateSegment 锁 | 版本结构访问，具体锁型以实现为准 |
+| Catalog write_lock + set catalog_lock | 元数据写临界区、读写集合保护 |
+| cleanup_lock | 按序清理 |
 
-| 异常 | DuckDB 是否存在 |
-|------|---------------|
-| 脏读（Dirty Read） | **不存在** — 未提交数据（transaction_id >= TRANSACTION_ID_START）对其他事务不可见 |
-| 不可重复读（Non-Repeatable Read） | **不存在** — 同一事务使用固定 start_time 快照 |
-| 幻读（Phantom Read） | **不存在（通常）** — 新插入行的 insert_id > start_time，对已开始事务不可见 |
-| 写偏（Write Skew） | **理论上存在** — 快照隔离的固有特性，DuckDB 不提供串行化（Serializable）隔离 |
+`CanCheckpoint/GetCheckpointType` 在其他事务活跃且本事务含更新或删除 Catalog 条目时可能拒绝自动 checkpoint；可接受的追加/删除场景使用 CONCURRENT_CHECKPOINT。存储层还可因取不到 vacuum 独占锁将 FULL 降为 CONCURRENT。详见 [STARTUP_AND_CRASH_RECOVERY_DESIGN.md](STARTUP_AND_CRASH_RECOVERY_DESIGN.md)。
 
----
+## 九、MetaTransaction 与隔离范围
 
-## 五、原子性（Atomicity）详解
+[meta_transaction.cpp](../src/transaction/meta_transaction.cpp) 的 `GetTransaction` 按 AttachedDatabase 延迟创建子事务，`ModifyDatabase` 限制一个事务只能写一个普通 attached database，system/temp 例外。Commit 逆序逐个提交；遇错对尚未提交的子事务回滚，不会反向撤销已经提交的子事务。因此它不是通用两阶段提交，也不能宣称“任一失败则所有库全部回滚”。
 
-原子性由 `UndoBuffer` 的回滚机制保证：
+对内置表的普通事务读取，快照规则排除其他事务的未提交版本，并维持固定 view；这不等于可串行化，也不覆盖所有 volatile 函数、外部数据源与跨库延迟子事务的统一全局快照。本文没有运行隔离级别异常测试，避免用“绝不幻读”的泛化表格替代具体可见性规则。
 
-1. 事务执行的每一步变更都被记录为 Undo Buffer 中的一个条目
-2. 发生回滚时，**逆序**遍历 Undo Buffer 并逐条撤销：
-   - Catalog 变更：恢复旧版本条目进入版本链
-   - 行追加：将已插入的行标记为回滚（`RevertAppend`）
-   - 行删除：将 `deleted[row]` 重置为 `NOT_DELETED_ID`
-   - 行更新：从 UpdateInfo 版本链中移除本事务的版本，恢复原始值
-3. 所有撤销完成后，事务的所有变更对外均不可见
-
----
-
-## 六、持久性（Durability）详解
-
-持久性通过 **Write-Ahead Log（WAL）** 实现：
-
-```
-提交流程：
-1. DuckTransaction::WriteToWAL()
-   ↓
-2. 遍历 Undo Buffer，将变更写入 WAL 文件
-   - Catalog 变更：写 CREATE/DROP/ALTER 记录
-   - 行追加：写 INSERT 记录
-   - 行删除：写 DELETE 记录
-   - 行更新：写 UPDATE 记录
-   ↓
-3. Flush WAL 文件到磁盘（fsync）
-   ↓
-4. 内存中应用 commit（更新所有 ChunkInfo 版本号为 commit_id）
-```
-
-崩溃恢复时，DuckDB 重放 WAL 文件中未 Checkpoint 的记录，将数据库恢复到崩溃前最后一次成功提交的状态。
-
-**Checkpoint**：WAL 文件积累到一定大小后，DuckDB 将全部内存数据持久化到主数据库文件（`.db`），然后截断 WAL。Checkpoint 需要获取独占的 `checkpoint_lock`，与所有读写事务共享锁互斥，保证 Checkpoint 时无未提交事务。
-
----
-
-## 七、并发控制与锁
-
-| 锁 | 位置 | 用途 |
-|---|------|------|
-| `transaction_lock` | `DuckTransactionManager` | 保护 `active_transactions` 等列表的并发访问 |
-| `start_transaction_lock` | `DuckTransactionManager` | 读写事务开始时串行化，防止 FORCE CHECKPOINT 期间新事务开启 |
-| `version_lock` | `RowVersionManager` | 保护 `vector_info` 数组的并发修改 |
-| `StorageLock (checkpoint_lock)` | `DuckTransactionManager` | 协调事务（共享锁）与 Checkpoint（独占锁） |
-| `DuckCatalog::write_lock` | `DuckCatalog` | Catalog 写操作互斥（防止并发 DDL） |
-| `cleanup_lock` | `DuckTransactionManager` | 保证 GC 串行执行（防止乱序 Cleanup 引发 Catalog 错误） |
-
-**乐观并发控制（Optimistic Concurrency Control）**：  
-DuckDB 的数据行版本更新不使用悲观锁，而是在写入时检测冲突。对于 DELETE 操作，若发现目标行已被另一活跃事务删除（`deleted[row] != NOT_DELETED_ID`），直接抛出异常回滚当前事务，而不是等待。
-
----
-
-## 八、LocalStorage（事务本地存储）
-
-`LocalTableStorage` （`src/include/duckdb/transaction/local_storage.hpp`）是事务期间存储未提交追加数据的结构：
-
-- 每个被修改的表对应一个 `LocalTableStorage`
-- 内部使用独立的 `RowGroupCollection`（与全局 RowGroup 隔离）
-- 事务扫描时会合并全局存储与 LocalStorage 的结果
-- 提交时，LocalStorage 的数据通过 `OptimisticDataWriter` 写入全局 RowGroup
-- 回滚时，直接丢弃 LocalStorage
-
----
-
-## 九、跨数据库事务（MetaTransaction）
-
-**`MetaTransaction`**（`src/include/duckdb/transaction/meta_transaction.hpp`）管理跨多个 Attached Database 的事务：
-
-```cpp
-class MetaTransaction {
-    timestamp_t start_timestamp;      // 全局开始时间
-    transaction_t global_transaction_id; // 全局事务 ID
-    reference_map_t<AttachedDatabase, TransactionReference> transactions; // 每个 DB 的子事务
-};
-```
-
-提交时按数据库逐一提交，若任一失败则全部回滚（尽力而为的原子性，非严格两阶段提交）。
-
----
-
-## 十、关键源码索引
-
-| 文件 | 说明 |
-|------|------|
-| `src/transaction/duck_transaction.cpp` | 事务开始/提交/回滚/清理主逻辑 |
-| `src/transaction/duck_transaction_manager.cpp` | 事务管理器：分配时间戳、管理活跃事务、触发 GC |
-| `src/transaction/undo_buffer.cpp` | Undo Buffer 的写入、Commit、Rollback、Cleanup 遍历 |
-| `src/transaction/commit_state.cpp` | Commit 时处理各类 Undo Entry（写 WAL、更新版本号） |
-| `src/transaction/rollback_state.cpp` | Rollback 时处理各类 Undo Entry（逆向撤销） |
-| `src/transaction/cleanup_state.cpp` | Cleanup 时处理各类 Undo Entry（GC 旧版本） |
-| `src/storage/table/chunk_info.cpp` | MVCC 核心：`TransactionVersionOperator` 可见性判断 |
-| `src/storage/table/row_version_manager.cpp` | 管理一个 RowGroup 内所有 Vector 的版本信息 |
-| `src/storage/table/update_segment.cpp` | UpdateInfo 版本链的写入、读取、回滚、清理 |
-| `src/transaction/local_storage.cpp` | 事务本地未提交数据管理 |
-| `src/catalog/catalog_set.cpp` | Catalog MVCC：`UseTimestamp`、`GetEntryForTransaction` |
+相关文档：[CATALOG_TRANSACTION_DESIGN.md](CATALOG_TRANSACTION_DESIGN.md)、[DEPENDENCY_MANAGER_DESIGN.md](DEPENDENCY_MANAGER_DESIGN.md)、[ART_INDEX_DESIGN.md](ART_INDEX_DESIGN.md)。

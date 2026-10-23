@@ -1,357 +1,134 @@
 # PhysicalInsert 执行设计文档
 
+> 适用源码：`v2.0-cyanoptera` @ `c1cd2470a455`；核对日期：2026-10-23。核对方式：静态源码审查，未执行本文示例或性能测试。
+
 ## 概述
 
-本文档梳理 `PhysicalInsert` 算子的完整执行流程，重点说明 Sink / Combine / Finalize 三个阶段的调用路径、并行与串行 Combine 的判定逻辑、`Combine()` 在 `preserve_insertion_order = false` 时触发的串行慢路径，以及计划器如何在 `PhysicalInsert` 与 `PhysicalBatchInsert` 之间做出选择。`PhysicalBatchInsert` 的详细设计参见 `dev_docs/BATCH_INSERT_DESIGN.md`，本文不重复。
+`PhysicalInsert` 同时承接普通 INSERT 和部分 CTAS。它有串行追加、并行线程本地追加两条路径；当前实现还会在 `Finalize()` 中压实跨线程的小 collection，不能再把 Finalize 描述为空操作。批次索引路径见 [BATCH_INSERT_DESIGN.md](BATCH_INSERT_DESIGN.md)。
 
----
+本文流程图都是省略异常与框架调度细节的控制流示意；行组大小来自目标表，不能固定等同于默认值 122880。算子完成也不等于事务提交或 WAL 已同步。
 
-## 一、源码文件总览
+## 一、计划器的精确选择条件
 
-| 文件 | 说明 |
-|------|------|
-| `src/include/duckdb/execution/operator/persistent/physical_insert.hpp` | `PhysicalInsert`、`InsertGlobalState`、`InsertLocalState` 类声明 |
-| `src/execution/operator/persistent/physical_insert.cpp` | `PhysicalInsert` 完整实现，含 `Sink`、`Combine`、`Finalize`、`OnConflictHandling` 等 |
-| `src/execution/physical_plan/plan_insert.cpp` | 计划器入口：`DuckCatalog::PlanInsert()`、`PreserveInsertionOrder()`、`UseBatchIndex()` |
-| `src/include/duckdb/execution/physical_plan_generator.hpp` | `PhysicalPlanGenerator` 声明，含 `PreserveInsertionOrder`、`UseBatchIndex` 静态方法 |
-| `src/include/duckdb/execution/operator/persistent/physical_batch_insert.hpp` | `PhysicalBatchInsert` 声明（对比参考） |
-| `src/execution/operator/persistent/physical_batch_insert.cpp` | `PhysicalBatchInsert` 实现（对比参考） |
-| `src/storage/optimistic_data_writer.cpp` | `OptimisticDataWriter`：乐观写入器，用于并行路径的 Row Group 预刷盘 |
-| `src/transaction/local_storage.cpp` | `LocalStorage`：事务本地存储，`LocalAppend`/`LocalMerge` 的实现 |
+来源：[plan_insert.cpp](../src/execution/physical_plan/plan_insert.cpp)，符号 `DuckCatalog::PlanInsert`、`PhysicalPlanGenerator::PreserveInsertionOrder`、`UseBatchIndex`。
 
----
+先计算：
 
-## 二、类层次与核心字段
+- `parallel_streaming_insert = !PreserveInsertionOrder(context, child_plan)`。
+- `use_batch_index = UseBatchIndex(context, child_plan)`，要求调度器线程数不为 1，且 `AllSourcesSupportBatchIndex()` 为真。
+- `RETURNING` 同时将上述两个开关置为 false。
+- `action_type != THROW` 禁用 batch index；`action_type == UPDATE` 另禁用 parallel streaming。
+- 旧计划仍可能带 `column_index_map`，由 `ResolveDefaultsProjection` 补默认值投影；源码明确将此字段标为旧版本兼容。
 
-### 2.1 PhysicalInsert（`physical_insert.hpp:66`）
+随后按最终开关选择：
 
-```cpp
-class PhysicalInsert : public PhysicalOperator {
-    optional_ptr<TableCatalogEntry> insert_table; // 目标表
-    vector<LogicalType>             insert_types;  // 目标表列类型
-    vector<unique_ptr<BoundConstraint>> bound_constraints;
-    bool return_chunk;          // 是否有 RETURNING 子句
-    bool parallel;              // 是否启用并行写入路径（由计划器在构造时注入）
-    OnConflictAction action_type; // THROW / NOTHING / UPDATE / REPLACE
-    // ON CONFLICT 相关字段（条件表达式、目标列、SET 表达式等）
-    unique_ptr<Expression>      on_conflict_condition;
-    unique_ptr<Expression>      do_update_condition;
-    unordered_set<column_t>     conflict_target;
-    vector<unique_ptr<Expression>> set_expressions;
-    vector<PhysicalIndex>       set_columns;
-    vector<LogicalType>         set_types;
-    bool update_is_del_and_insert; // INSERT OR REPLACE 需要先删后插时为 true
-};
+| use_batch_index | parallel_streaming_insert | 构造结果 |
+|---|---|---|
+| true | false | `PhysicalBatchInsert` |
+| true | true | `PhysicalInsert(parallel = num_threads > 1)` |
+| false | true | `PhysicalInsert(parallel = num_threads > 1)` |
+| false | false | `PhysicalInsert(parallel = false)` |
+
+所以 batch insert 不是按估计行数或 SQL 名称直接选择的。单线程不会选择 batch，也不会启用并行 `PhysicalInsert`。`preserve_insertion_order=false` 不能覆盖源报告的 `FIXED_ORDER`。
+
+顺序检查递归到 source，忽略物理 CTE 的第 0 个物化 child，按遍历遇到的首个非 `INSERTION_ORDER` 结果返回：`FIXED_ORDER` 强制保序，`NO_ORDER` 不保序，其余读取设置。不要把它简化为“只看全局设置”，也不要将某一种文件格式一概认定为固定顺序源。
+
+`REPLACE` 只存在于 transform/bind 阶段，之后改写为 `UPDATE`，因此不能把 DO REPLACE 列为并行 NOTHING 路径。见 [insert_statement.hpp](../src/include/duckdb/parser/statement/insert_statement.hpp) 的 `OnConflictAction` 和 [bind_insert.cpp](../src/planner/binder/statement/bind_insert.cpp) 的 REPLACE 分支。
+
+CTAS 有独立入口 [plan_create_table.cpp](../src/execution/physical_plan/plan_create_table.cpp)：`DuckCatalog::PlanCreateTableAs` 使用相同的顺序/batch 条件；是否真的进入 CTAS 路径还取决于已有表、REPLACE 和是否有查询 child。
+
+## 二、状态与所有权
+
+声明：[physical_insert.hpp](../src/include/duckdb/execution/operator/persistent/physical_insert.hpp)。
+
+| 状态 | 关键内容 |
+|---|---|
+| `PhysicalInsert` | 目标表或 CTAS 的 schema/info、`parallel`、`return_chunk`、约束及冲突更新表达式 |
+| `InsertGlobalState` | `lock`、`insert_count`、`return_collection`、`unmerged_collections` |
+| `InsertLocalState` | collection 索引、append state、optimistic writer、约束状态、update/append chunk、delete state |
+| 更新去重 | `unique_ptr<RowIdDeduplicator> updated_rows` 与 `update_count`，不再是旧版 `unordered_set<row_t>` |
+
+[physical_insert.cpp](../src/execution/operator/persistent/physical_insert.cpp) 中 `GetGlobalSinkState` 为 CTAS 创建表；`InsertGlobalState` 构造时 `BindIndexes`。线程本地 collection 在首次并行 `Sink` 时创建，空线程无需分配。绑定索引是运行时数据结构绑定，不是“索引归当前事务独占”。
+
+## 三、Sink：接收输入
+
+来源：同文件 `PhysicalInsert::Sink`、`OnConflictHandling`、`HandleInsertConflicts`。
+
+```text
+串行 Sink
+  Flatten
+  OnConflictHandling
+  累加新插入行数与受影响更新数
+  有 RETURNING 则收集输出
+  LocalAppend（THROW 路径可复用已做的约束检查）
+  UPDATE 内部重复键产生的 update_chunk 再进入冲突处理
+
+并行 Sink
+  Flatten
+  必要时在 gstate.lock 下创建本线程 optimistic collection/writer
+  OnConflictHandling
+  collection.Append
+  若返回可刷出的 row-group index，WriteNewRowGroup
 ```
 
-`parallel` 字段由 `DuckCatalog::PlanInsert()` 在生成物理计划时注入，运行期不变（见第六节）。
+并行路径的 `!return_chunk`、`action_type != UPDATE` 有 `D_ASSERT`，受支持的组合主要由计划器阻止；断言本身不是 release 下的输入校验。线程拥有不同 collection 不代表整个 Sink 无锁：初始化、约束检查、索引访问和底层存储仍可能加锁。
 
-### 2.2 InsertGlobalState（`physical_insert.hpp:26`）
+`OnConflictHandling` 的 THROW 分支执行 `VerifyAppendConstraints`。NOTHING/UPDATE 会检查输入 chunk 内重复键，再分别处理全局与事务本地冲突；冲突目标、WHERE、SET、旧值 Fetch 都会影响处理结果。当前对“chunk 内重复键且带条件 DO UPDATE”的组合有显式 `NotImplementedException`，不能宣称冲突语义无条件完整支持。
 
-```cpp
-class InsertGlobalState : public GlobalSinkState {
-    mutex                lock;            // 保护 insert_count 和 Combine 阶段的并发合并
-    DuckTableEntry      &table;
-    idx_t                insert_count;   // 累计插入行数
-    ColumnDataCollection return_collection; // RETURNING 子句的结果集（非并行路径）
-};
+## 四、Combine：大 collection 直接归并，小 collection 延迟
+
+来源：[physical_insert.cpp](../src/execution/operator/persistent/physical_insert.cpp) 的 `PhysicalInsert::Combine`。
+
+```text
+Combine
+  刷新 profiler
+  非并行或 collection index 无效 → FINISHED
+  collection.FinalizeAppend(TransactionData::Unversioned())
+  append_count = collection.GetTotalRows()
+  append_count >= table.row_group_size?
+    是 → WriteUnflushedRowGroups + writer.FinalFlush（全局锁之前）
+  持 gstate.lock
+    insert_count += append_count
+    小 collection → 只登记到 unmerged_collections
+    大 collection → LocalMerge + 合并本线程 writer
 ```
 
-`InsertGlobalState` 构造时调用 `table.GetStorage().BindIndexes(context)`，将表上的所有索引绑定到当前事务，为后续约束校验做准备（`physical_insert.cpp:78`）。
+修正点：小 collection 不在 Combine 中逐 chunk LocalAppend；大 collection 的预刷盘也不在全局临界区内。临界区仍串行维护共享状态和大 collection 的 LocalMerge，但不能据此断言其是测得的性能瓶颈。
 
-### 2.3 InsertLocalState（`physical_insert.hpp:37`）
+这里的“大小”按每个线程 collection 判断。Finalize 的小总量条件则使用全局 `insert_count`，两者不是同一个阈值判断。
 
-```cpp
-class InsertLocalState : public LocalSinkState {
-    DataChunk            update_chunk;       // DO UPDATE 冲突处理的暂存块
-    DataChunk            append_chunk;       // INSERT OR REPLACE 的插入块
-    TableAppendState     local_append_state; // 并行路径 Append 状态（行偏移等）
-    PhysicalIndex        collection_index;   // 并行路径：本线程 OptimisticCollection 的索引
-    unique_ptr<OptimisticDataWriter> optimistic_writer; // 并行路径：乐观刷盘写入器
-    unordered_set<row_t> updated_rows;       // DO UPDATE 已处理行集合（防重复更新）
-    unique_ptr<ConstraintState>  constraint_state; // 约束校验状态（懒创建）
-    unique_ptr<TableDeleteState> delete_state;     // DELETE+INSERT 模式的删除状态
-    const vector<unique_ptr<BoundConstraint>> &bound_constraints;
-};
+## 五、Finalize：跨线程剩余数据的压实
+
+来源：同文件 `PhysicalInsert::Finalize`、`MergeCollectionsEvent`、`MergeCollectionsTask`，以及共享的 [collection_merger.hpp](../src/include/duckdb/execution/operator/persistent/collection_merger.hpp) 中 `CollectionMerger::Flush`。
+
+| 条件 | 行为 |
+|---|---|
+| `unmerged_collections.empty()` | 直接 READY |
+| 有剩余且 `insert_count < row_group_size` | 初始化一次 LocalAppend，扫描所有剩余 collection 逐 chunk 追加，reset collection，FinalizeLocalAppend |
+| 有剩余且总量达到行组大小 | 将剩余 collection 累加分组，每组达到行组大小就关闭，尾组可不足；插入 `MergeCollectionsEvent` |
+
+事件的 `Schedule()` 为每组创建独立 writer 与 `MergeCollectionsTask`，任务调用 `merger.Flush(writer)`。`FinishEvent()` 再顺序 LocalMerge、reset collection、合并各 writer，最后全局 writer FinalFlush。
+
+```text
+所有 local Combine
+  → PhysicalInsert::Finalize
+    → [小总量] 直接 LocalAppend
+    → [大总量] event.InsertEvent(MergeCollectionsEvent)
+                   Schedule: 多组 Flush 任务
+                   FinishEvent: LocalMerge + writer 合并 + FinalFlush
+  → 后续依赖事件 / Source
 ```
 
-`collection_index` 初始值为 `DConstants::INVALID_INDEX`（`physical_insert.cpp:83`），非并行路径不写入 `OptimisticCollection`，故该字段始终无效；并行路径在首次 `Sink()` 调用时懒初始化。
+Finalize 返回 READY 不意味着插入的事件已经执行；事件依赖承担后续顺序约束。此实现与 batch insert 共用 CollectionMerger，但分组依据不同：这里按线程完成顺序收集剩余数据，batch 路径按 batch index 维护顺序。
 
----
+## 六、Source、提交与可见性
 
-## 三、完整执行流程
+`GetDataInternal` 在无 RETURNING 时输出 BIGINT 的 `insert_count`；有 RETURNING 时扫描 `return_collection`。更新结果的收集还涉及 `PerformOnConflictAction`，不能仅将 Sink 中追加的新行看作 RETURNING 的全部内容。
 
-整体调用顺序由 Pipeline 执行框架驱动（参见 `PIPELINE_EXECUTION_DESIGN.md`）：
+`LocalAppend` / `LocalMerge` 将结果交给事务本地存储；optimistic writer 可能预写数据块，但这既不单独发布 MVCC 可见性，也不等价于 COMMIT。参见 [local_storage.cpp](../src/storage/local_storage.cpp) 的 `LocalStorage::Flush/Commit/Rollback`、[TRANSACTION_MVCC_DESIGN.md](TRANSACTION_MVCC_DESIGN.md) 与 [STARTUP_AND_CRASH_RECOVERY_DESIGN.md](STARTUP_AND_CRASH_RECOVERY_DESIGN.md)。
 
-```
-GetGlobalSinkState()   ─── Pipeline 初始化阶段（每条 Pipeline 一次）
-GetLocalSinkState()    ─── 每线程一次
+## 七、阅读与性能边界
 
-[每线程并发执行]
-  Sink(chunk)          ─── 处理每个输入 DataChunk
-  ...
-
-Combine()              ─── 每线程完成所有 Sink 调用后执行一次
-                            （所有线程的 Combine 并发执行，但内部有锁）
-
-Finalize()             ─── 所有线程 Combine 完成后执行一次
-
-GetDataInternal()      ─── Source 阶段，返回 insert_count 或 RETURNING 结果集
-```
-
-### 3.1 GetGlobalSinkState（`physical_insert.cpp:104`）
-
-若为 `CREATE TABLE AS`，先调用 `catalog.CreateTable()` 创建目标表，再构造 `InsertGlobalState`。`InsertGlobalState` 构造函数中会调用 `BindIndexes(context)` 将表索引绑定到当前事务，以便 `Sink()` 阶段进行约束校验。
-
-### 3.2 GetLocalSinkState（`physical_insert.cpp:121`）
-
-分配 `InsertLocalState`，初始化 `update_chunk`、`append_chunk` 的列类型，`collection_index` 设为无效值。
-
-### 3.3 Sink — 非并行路径（`physical_insert.cpp:618`）
-
-当 `parallel == false` 时走此路径：
-
-```
-Sink(insert_chunk)
-├─ insert_chunk.Flatten()
-├─ OnConflictHandling()               // 约束校验 + 冲突处理（见 3.5）
-├─ gstate.insert_count += chunk.size() + updated_tuples
-├─ 若 return_chunk → gstate.return_collection.Append(insert_chunk)
-├─ storage.LocalAppend(table, client, insert_chunk, bound_constraints)
-│      // 直接追加到事务本地存储，无 OptimisticCollection
-└─ 若 action_type == UPDATE && lstate.update_chunk 非空
-       → HandleInsertConflicts<true>() + HandleInsertConflicts<false>()
-         // 将 update_chunk 中的行触发 DO UPDATE 处理，处理后 chunk 应归零
-```
-
-非并行路径的所有数据直接写入事务本地存储（`LocalStorage`），`collection_index` 始终无效，`Combine()` 只做性能统计后直接返回（见 3.6）。
-
-### 3.4 Sink — 并行路径（`physical_insert.cpp:644`）
-
-当 `parallel == true` 时走此路径（此路径不支持 `RETURNING`，`D_ASSERT(!return_chunk)`）：
-
-```
-Sink(insert_chunk)
-├─ insert_chunk.Flatten()
-├─ 若 !lstate.collection_index.IsValid()  // 懒初始化
-│   ├─ lock_guard(gstate.lock)
-│   ├─ lstate.optimistic_writer = make_uniq<OptimisticDataWriter>(client, data_table)
-│   ├─ 创建 OptimisticCollection 并调用 InitializeAppend()
-│   └─ lstate.collection_index = data_table.CreateOptimisticCollection(...)
-├─ OnConflictHandling()
-│      // 并行路径不支持 action_type == UPDATE（D_ASSERT）
-├─ collection.Append(insert_chunk, lstate.local_append_state)
-└─ 若产生新 Row Group → lstate.optimistic_writer->WriteNewRowGroup(collection)
-       // 乐观预刷盘：将已满的 Row Group 写入磁盘，不影响其他事务可见性
-```
-
-并行路径为每个线程分配独立的 `RowGroupCollection`（通过 `OptimisticDataWriter` 管理），线程间写入互不干扰，锁仅在初始化阶段使用，Append 阶段完全无锁。
-
-### 3.5 OnConflictHandling（`physical_insert.cpp:517`）
-
-两条路径的 `Sink()` 均调用此方法。核心逻辑如下：
-
-```
-OnConflictHandling(insert_chunk)
-├─ action_type == THROW
-│   └─ VerifyAppendConstraints()  // 校验失败则抛异常，insert_chunk 不变
-├─ action_type == NOTHING / UPDATE
-│   ├─ CheckDistinctness()        // 检测 insert_chunk 内部的重复键
-│   ├─ 过滤重复行，保留唯一行
-│   ├─ HandleInsertConflicts<true>()   // 与全局存储对比冲突
-│   └─ HandleInsertConflicts<false>()  // 与事务本地存储对比冲突
-│       ├─ VerifyAppendConstraints / VerifyUniqueIndexes → ConflictManager
-│       ├─ 若 `types_to_fetch` 非空（如 `WHERE` 条件或 `SET` 表达式引用现有值）→ 扫描冲突行的现有值（Fetch）
-│       ├─ VerifyOnConflictCondition（WHERE 子句）
-│       ├─ PerformOnConflictAction：Update / Delete+Insert
-│       └─ 从 insert_chunk 中移除冲突行（Slice）
-└─ 返回 updated_tuples 数量
-```
-
-完成后 `insert_chunk` 只包含需要真正插入的新行（冲突行已被处理或丢弃）。
-
-### 3.6 Combine（`physical_insert.cpp:673`）
-
-`Combine()` 由 Pipeline 框架在每个线程完成所有 `Sink()` 调用后触发，多个线程的 `Combine()` 调用并发执行，但内部以互斥锁串行化关键合并操作。
-
-```
-Combine()
-├─ 刷新线程 profiler 到 client_profiler
-├─ [line 680] if (!parallel || !lstate.collection_index.IsValid())
-│       return FINISHED    // ← 快速返回（见第四节）
-│
-├─ collection.FinalizeAppend(tdata, lstate.local_append_state)
-│       // 提交本线程 OptimisticCollection 的 Append 状态，固定行数
-├─ append_count = collection.GetTotalRows()
-├─ lock_guard(gstate.lock)             // ← 串行化临界区
-├─ gstate.insert_count += append_count
-├─ if append_count < row_group_size    // 小数据路径
-│   ├─ storage.InitializeLocalAppend()
-│   ├─ for chunk in collection.Chunks() → storage.LocalAppend()
-│   └─ storage.FinalizeLocalAppend()
-└─ else                                // 大数据路径
-    ├─ lstate.optimistic_writer->WriteUnflushedRowGroups(collection)
-    ├─ lstate.optimistic_writer->FinalFlush()
-    ├─ data_table.LocalMerge(client, collection)
-    └─ GetOptimisticWriter(client).Merge(*lstate.optimistic_writer)
-```
-
-### 3.7 Finalize（`physical_insert.cpp:720`）
-
-```cpp
-SinkFinalizeType PhysicalInsert::Finalize(...) const {
-    return SinkFinalizeType::READY;
-}
-```
-
-`PhysicalInsert` 的 `Finalize()` 是空实现，直接返回 `READY`。所有实质性的数据落盘工作均在 `Sink()`（非并行路径）或 `Combine()`（并行路径）中完成，`Finalize()` 无需额外处理。这与 `PhysicalBatchInsert` 的重量级 `Finalize()`（全局 `CollectionMerger` 合并 + 最终刷盘）形成鲜明对比。
-
-### 3.8 GetDataInternal（`physical_insert.cpp:745`）
-
-```
-GetDataInternal()
-├─ 若 !return_chunk
-│   └─ chunk[0] = BIGINT(insert_gstate.insert_count)  → FINISHED
-└─ 若 return_chunk
-    └─ return_collection.Scan(scan_state, chunk)
-       → HAVE_MORE_OUTPUT（直到扫描完毕 → FINISHED）
-```
-
----
-
-## 四、并行与串行 Combine 的判定
-
-`Combine()` 在第 680 行的条件决定了是走快速返回还是走实际合并逻辑：
-
-```cpp
-// physical_insert.cpp:680
-if (!parallel || !lstate.collection_index.IsValid()) {
-    return SinkCombineResultType::FINISHED;
-}
-```
-
-满足以下任一条件时快速返回，不执行合并：
-
-| 条件 | 原因 |
-|------|------|
-| `!parallel` | 非并行路径：所有数据已在 `Sink()` 中直接写入 `LocalStorage`，`Combine()` 无事可做 |
-| `!lstate.collection_index.IsValid()` | 并行路径但该线程未收到任何数据（如空表或分区后某线程无数据），无需合并 |
-
-只有当 `parallel == true` 且线程确实写入了数据时，`Combine()` 才执行实际的合并操作。
-
-`parallel` 字段由计划器在构造 `PhysicalInsert` 时注入（`plan_insert.cpp:129`，`PhysicalInsert` 构造分支）：
-
-```cpp
-parallel_streaming_insert && num_threads > 1
-```
-
-其中 `parallel_streaming_insert = !PreserveInsertionOrder(context, *plan)`，即当**不需要保留插入顺序**时为 `true`（数据源为 `NO_ORDER` 时无论配置如何均不保序；数据源为 `INSERTION_ORDER` 时取决于 `preserve_insertion_order` 配置；`FIXED_ORDER` 始终保序，见 §6.1）。换言之，只有在以下全部条件成立时，`parallel` 才为 `true`：
-
-1. `PreserveInsertionOrder()` 返回 `false`（数据源为 `NO_ORDER`，或数据源为 `INSERTION_ORDER` 且 `preserve_insertion_order` 配置为 `false`）。
-2. 线程数 > 1。
-3. `action_type != UPDATE`（`DO UPDATE` 需要防止同一行被更新两次，不支持并行流式写入）。
-4. `return_chunk == false`（`RETURNING` 子句当前不支持并行路径）。
-
----
-
-## 五、Combine 慢路径详解（`parallel == true` 时的串行合并）
-
-当 `parallel == true`（即不需要保留插入顺序且满足其余条件）时，`Combine()` 的 `!parallel` 条件不成立，不再快速返回，而是执行如下串行化合并——这正是"慢路径"的含义。`parallel == true` 的完整前置条件参见第四节：`PreserveInsertionOrder()` 需返回 `false`，还要求线程数 > 1、无 `DO UPDATE` 子句、无 `RETURNING` 子句。
-
-### 5.1 为什么串行
-
-第 697 行的 `lock_guard<mutex> lock(gstate.lock)` 使所有线程的合并操作串行化执行。尽管各线程的 `Append` 阶段（在 `Sink()` 内）是完全并行的，但最终将线程本地 `RowGroupCollection` 归并进事务本地存储时，必须串行，原因有二：
-
-1. `gstate.insert_count` 是共享计数器，需要互斥保护。
-2. `storage.InitializeLocalAppend()` / `LocalAppend()` / `FinalizeLocalAppend()` 以及 `LocalMerge()` / `OptimisticWriter.Merge()` 均操作事务本地存储的共享数据结构，不支持并发写入。
-
-### 5.2 慢路径的两个子分支
-
-**小数据路径**（`append_count < row_group_size`，默认阈值 122880 行，由 `DataTable::GetRowGroupSize()` 返回）：
-
-所有数据仍在内存中，尚未乐观刷盘。直接通过 `LocalAppend` 逐 Chunk 写入事务本地存储，开销较低，不需要合并 Row Group。
-
-**大数据路径**（`append_count >= row_group_size`）：
-
-该线程已通过 `OptimisticDataWriter` 乐观地将部分 Row Group 刷到磁盘。此时需要：
-
-1. `WriteUnflushedRowGroups`：将尚未刷盘的末尾 Row Group 写出。
-2. `FinalFlush`：完成所有乐观写入。
-3. `LocalMerge`：将整个 `OptimisticCollection` 归并进事务本地存储。
-4. `OptimisticWriter.Merge`：将本线程的 `OptimisticDataWriter` 合并入全局的 `OptimisticWriter`，以便事务提交时统一处理。
-
-### 5.3 并行替代方案：PhysicalBatchInsert
-
-在多线程环境下，若数据源支持批次索引、无 ON CONFLICT 子句，**且 `parallel_streaming_insert` 为 `false`（即必须保留插入顺序）**，计划器才会选择 `PhysicalBatchInsert`（见第六节，`plan_insert.cpp:122`）。换言之，即便支持批次索引，只要不需要保序（`parallel_streaming_insert == true`），计划器仍优先走 `PhysicalInsert(parallel=true)` 流式并行路径。`PhysicalBatchInsert` 通过以下机制避免 `Combine()` 的串行瓶颈：
-
-- 每个线程只写独立的批次（`BatchIndex` 隔离），`Combine()` 仅将本批次注册到全局 `collections`，无需持有长时间锁。
-- 真正的合并工作由后台 `MergeCollectionTask` 异步执行，与 `Sink()` 流水线化。
-- 全局合并与刷盘推迟到 `Finalize()` 阶段统一完成（见 `BATCH_INSERT_DESIGN.md` §四）。
-
-`PhysicalInsert` 并行路径（`parallel=true`）适用于普通 INSERT 以及不需要 UPDATE 的冲突处理（`DO NOTHING`/`DO REPLACE`）。`RETURNING` 子句和 `DO UPDATE` 冲突处理会在计划阶段将 `parallel_streaming_insert` 强制置为 `false`（`plan_insert.cpp:105-108`、`:114-118`），因此它们始终走非并行路径，不会触发 `Combine()` 的串行慢路径。`Combine()` 慢路径之所以存在，是因为并行写入最终需要将各线程的 `RowGroupCollection` 归并进事务本地存储，而事务本地存储不支持并发写入，必须串行化。
-
----
-
-## 六、计划器如何选择 PhysicalInsert vs PhysicalBatchInsert
-
-计划入口为 `DuckCatalog::PlanInsert()`（`plan_insert.cpp:100`），核心决策逻辑如下：
-
-```cpp
-// plan_insert.cpp:102
-bool parallel_streaming_insert = !PhysicalPlanGenerator::PreserveInsertionOrder(context, *plan);
-bool use_batch_index           = PhysicalPlanGenerator::UseBatchIndex(context, *plan);
-
-if (op.return_chunk)                        { parallel_streaming_insert = false; use_batch_index = false; }
-if (action_type != THROW)                   { use_batch_index = false; }
-if (action_type == UPDATE)                  { parallel_streaming_insert = false; }
-
-if (use_batch_index && !parallel_streaming_insert) {
-    // → PhysicalBatchInsert
-} else {
-    // → PhysicalInsert(parallel = parallel_streaming_insert && num_threads > 1)
-}
-```
-
-### 6.1 PreserveInsertionOrder（`plan_insert.cpp:37`）
-
-递归检查子计划树的顺序保证类型（`OrderPreservationRecursive`），结合配置 `preserve_insertion_order` 做出决策：
-
-| `OrderPreservationType` | `PreserveInsertionOrder` 返回值 |
-|------------------------|-------------------------------|
-| `FIXED_ORDER`（如 ORDER BY、文件读取） | `true`（必须保序） |
-| `NO_ORDER`（如 Hash Join 输出） | `false`（允许乱序） |
-| `INSERTION_ORDER`（默认） | 取决于 `preserve_insertion_order` 配置（默认 `true`） |
-
-### 6.2 UseBatchIndex（`plan_insert.cpp:59`）
-
-满足以下全部条件时返回 `true`：
-
-1. 线程数 > 1（单线程无意义）。
-2. 子计划所有数据源均支持批次索引（`AllSourcesSupportBatchIndex()`），典型场景为读取多个 Parquet 或 CSV 文件的 `COPY` 操作。
-
-### 6.3 决策矩阵
-
-| `use_batch_index` | `parallel_streaming_insert` | 结果 | 备注 |
-|-------------------|----------------------------|------|------|
-| `true` | `false` | `PhysicalBatchInsert` | 多线程、有序源、无 ON CONFLICT → 批量写入最优路径 |
-| `true` | `true` | `PhysicalInsert(parallel=true)` | `preserve_insertion_order=false` 时并行流式写入优先 |
-| `false` | `true` | `PhysicalInsert(parallel=true)` | 源不支持批次索引，但允许乱序并行写入 |
-| `false` | `false` | `PhysicalInsert(parallel=false)` | 单线程或必须保序且无批次索引 |
-
-以及强制使用 `PhysicalInsert` 的情况：
-
-- 含 `RETURNING` 子句（`return_chunk = true`）
-- 含 `ON CONFLICT DO NOTHING` / `DO UPDATE` / `DO REPLACE`
-- 单线程执行（`num_threads == 1`）
-
-详细对比参见 `dev_docs/BATCH_INSERT_DESIGN.md` §六。
-
----
-
-## 七、关键设计决策
-
-`PhysicalInsert` 的并行路径（`parallel = true`）是一种"先并行写入、后串行合并"的折中方案。各线程在 `Sink()` 阶段完全并行地向各自的 `OptimisticCollection` 追加数据，充分利用多核写入能力；而 `Combine()` 阶段的串行化合并是不可避免的代价——事务本地存储不支持并发写入，且 `insert_count` 需要全局汇总。对于小数据量（< 1 个 Row Group），串行合并的开销可以忽略；对于大数据量，`Combine()` 的串行临界区会成为瓶颈，此时 `PhysicalBatchInsert` 是更好的选择。
-
-`Finalize()` 的空实现是有意为之。`PhysicalInsert` 将数据归并的时机前移到 `Combine()`（并行路径：`RowGroupCollection` 归并进事务本地存储）或 `Sink()`（非并行路径：直接 `LocalAppend`），不存在需要推迟到全局收尾阶段的操作。`RETURNING` 子句和 `DO UPDATE` 冲突处理均强制走非并行路径，在各自的 `Sink()` 调用中实时处理，同样无需 `Finalize()` 介入。这与 `PhysicalBatchInsert` 将大量工作推迟到 `Finalize()` 的策略不同，是两种算子适用场景差异的直接体现。
-
-`InsertLocalState.collection_index` 的懒初始化（在首次 `Sink()` 调用时才分配 `OptimisticCollection`）确保了空写入线程不会占用不必要的存储资源，同时使 `Combine()` 中 `!lstate.collection_index.IsValid()` 的快速返回路径成为可能，减少了无数据线程的合并开销。
+- `ParallelSink()` 返回 `parallel`，表示可并行 sink；`SinkOrderDependent()` 为 true，必须连同计划器的顺序约束理解。
+- 不由数据量推荐强行切换算子；要先满足源 batch 能力、线程数、顺序与冲突处理限制。
+- 本文没有给出可直接编译的 C++ 扩展样例，没有执行 SQL 或性能测试；并发收益、I/O 重叠和锁开销均需独立测量。

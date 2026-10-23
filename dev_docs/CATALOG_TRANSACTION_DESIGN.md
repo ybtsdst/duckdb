@@ -1,328 +1,135 @@
 # DuckDB 元数据（Catalog）管理与事务支持设计文档
 
+> 适用源码：`v2.0-cyanoptera` @ `c1cd2470a455`；核对日期：2026-10-23。核对方式：静态源码审查，未执行本文示例或性能测试。
+
 ## 概述
 
-本文档整理了 DuckDB 内部元数据（Catalog）管理系统的核心设计，重点说明事务支持机制，为开发需要元数据管理能力的插件提供参考。
-
----
+本文描述内置 `DuckCatalog` 的版本链、锁、依赖验证与事务提交。`Catalog` 是扩展接口，其他存储扩展的实现不自动继承全部内置行为；函数注册、进程配置与外部系统状态也不能一概视作可回滚、可 WAL 持久化的用户 Catalog 对象。
 
 ## 一、总体架构
 
-DuckDB 的元数据管理系统（Catalog）负责跟踪数据库中所有对象（表、视图、函数、类型、序列、模式等）的定义信息。其核心层次结构如下：
-
-```
+```text
 DatabaseInstance
-  └── AttachedDatabase
-        └── DuckCatalog          ← 具体的 Catalog 实现
-              ├── CatalogSet (schemas)    ← 所有 Schema 的集合
-              │     └── SchemaCatalogEntry
-              │           └── CatalogSet (tables/views/functions/...)
-              │                 └── CatalogEntry (具体对象)
-              └── DependencyManager     ← 依赖关系管理
+  → 多个 AttachedDatabase
+    → 各自的 DuckCatalog（或扩展 Catalog）
+       → schema CatalogSet
+         → SchemaCatalogEntry（可有嵌套 schema）
+           → 各类 CatalogSet → CatalogEntry 版本链
+       → DependencyManager（subjects/dependents 两个 CatalogSet）
 ```
 
-**关键源码位置：**
+每个 DuckCatalog 管理自己的依赖，非整个 DatabaseInstance 唯一的一套。入口见 [duck_catalog.hpp](../src/include/duckdb/catalog/duck_catalog.hpp)、[catalog_set.hpp](../src/include/duckdb/catalog/catalog_set.hpp)、[catalog_entry.hpp](../src/include/duckdb/catalog/catalog_entry.hpp)。
 
-| 文件 | 说明 |
-|------|------|
-| `src/include/duckdb/catalog/catalog.hpp` | Catalog 抽象基类 |
-| `src/include/duckdb/catalog/duck_catalog.hpp` | DuckDB 具体 Catalog 实现 |
-| `src/include/duckdb/catalog/catalog_entry.hpp` | Catalog 条目基类 |
-| `src/include/duckdb/catalog/catalog_set.hpp` | 带版本管理的条目集合 |
-| `src/include/duckdb/catalog/catalog_transaction.hpp` | Catalog 操作的事务上下文 |
-| `src/include/duckdb/catalog/dependency_manager.hpp` | 对象间依赖关系管理 |
-| `src/catalog/catalog_set.cpp` | MVCC 版本链核心逻辑 |
-| `src/transaction/undo_buffer.hpp` | 回滚所需的 Undo Buffer |
-| `src/include/duckdb/transaction/duck_transaction.hpp` | 事务对象（含 Undo Buffer） |
+## 二、CatalogTransaction 与可见性
 
----
+[CatalogTransaction](../src/include/duckdb/catalog/catalog_transaction.hpp) 当前保存 db/context/transaction 可选引用与 `SnapshotView view`，不再直接持有 `transaction_id/start_time` 两个字段。构造实现见 [catalog_transaction.cpp](../src/catalog/catalog_transaction.cpp)：有 ClientContext 时取得对应 Catalog 的事务及快照；system transaction 使用专门构造的可见性边界。
 
-## 二、Catalog 事务支持
-
-### 2.1 事务上下文：CatalogTransaction
-
-所有 Catalog 操作（创建、删除、修改对象）都通过 `CatalogTransaction` 传递事务上下文。
+[transaction_data.hpp](../src/include/duckdb/transaction/transaction_data.hpp) 的真实规则是：
 
 ```cpp
-// src/include/duckdb/catalog/catalog_transaction.hpp
-struct CatalogTransaction {
-    optional_ptr<DatabaseInstance> db;
-    optional_ptr<ClientContext>   context;
-    optional_ptr<Transaction>     transaction;
-    transaction_t transaction_id;  // 当前事务 ID
-    transaction_t start_time;      // 事务开始时间戳
-};
+// SnapshotView::Sees 的函数体摘录
+return timestamp < visibility_bound || timestamp == transaction_id;
 ```
 
-- `transaction_id`：活跃事务的唯一标识，值 `>= TRANSACTION_ID_START`（精确值 `4611686018427388000`，约 2^62，定义于 `src/common/constants.cpp`）。
-- `start_time`：事务开始时的全局时间戳，用于快照隔离判断。
+[constants.hpp](../src/include/duckdb/common/constants.hpp) 的 `VisibilityBound::Before(t)` 表示 `< t`，`Through(t)` 表示 `< t+1`。普通新事务以 Before(start_time) 开始，但提交验证和系统扫描会构造不同 bound，不能把所有调用方统一代回 start_time。
 
-### 2.2 MVCC：基于版本链的多版本并发控制
+[catalog_set.cpp](../src/catalog/catalog_set.cpp) 中：
 
-`CatalogSet` 中每个条目通过 **版本链（version chain）** 实现 MVCC：
+- `UseTimestamp` 调用 `view.Sees(timestamp)`。
+- `HasConflict` 返回 `!view.Sees(timestamp)`，覆盖其他活跃事务和快照之外的提交。
+- `GetEntryForTransaction` 沿 root→child 查找可见版本。带 visible 输出的重载在走到底层 dummy 时置 false；返回引用不单独代表该对象存在且可见，调用方还要检查 deleted/lookup 状态。
 
-```
-map["table_name"]
-  └── CatalogEntry (最新版本，root)    timestamp = 正在提交的事务ID 或 已提交时间戳
-        └── child: CatalogEntry (上一版本)
-              └── child: CatalogEntry (更早版本)
-```
-
-- **root 节点** = 最新版本（或当前活跃写事务创建的版本）
-- **child 链** = 历史版本，用于旧事务的快照读
-
-**时间戳语义（`src/catalog/catalog_set.cpp`）：**
-
-```cpp
-// 已提交的条目：timestamp < TRANSACTION_ID_START（通常为提交时的 commit_id）
-// 未提交的条目：timestamp == 当前事务的 transaction_id（>= TRANSACTION_ID_START）
-
-bool CatalogSet::UseTimestamp(CatalogTransaction transaction, transaction_t timestamp) {
-    if (timestamp == transaction.transaction_id) {
-        return true;  // 当前事务自己创建的版本，可见
-    }
-    if (timestamp < transaction.start_time) {
-        return true;  // 在本事务启动之前已提交，可见
-    }
-    return false;     // 其他事务提交的（比本事务晚），不可见
-}
+```text
+名称映射 → 最新 CatalogEntry（可能未提交/删除墓碑）
+            → child：前一版本 → 更早版本 → 初始 dummy
 ```
 
-**版本查找（快照读）：**
+这里的冲突基于版本可见性，不能继续用旧伪代码的 `timestamp > start_time` 代替当前边界比较。
 
-```cpp
-CatalogEntry &CatalogSet::GetEntryForTransaction(CatalogTransaction transaction, CatalogEntry &current) {
-    reference<CatalogEntry> entry(current);
-    while (entry.get().HasChild()) {
-        if (UseTimestamp(transaction, entry.get().timestamp)) {
-            return entry.get();  // 找到对本事务可见的版本
-        }
-        entry = entry.get().Child();  // 沿版本链向历史方向遍历
-    }
-    return entry.get();
-}
+## 三、DDL 创建、修改、删除与锁
+
+来源：[catalog_set.cpp](../src/catalog/catalog_set.cpp) 的 `CreateEntry/CreateEntryInternal`、`AlterEntry`、`DropDependencies/DropEntry`、`Undo`。
+
+### 3.1 创建路径
+
+```text
+检查 entry 不变量
+→ timestamp = 当前 transaction_id，set = 本集合
+→ DependencyManager::AddObject（先于下面的写锁）
+→ DuckCatalog::GetWriteLock（mutex）
+→ CatalogSet::catalog_lock（mutex，阻止本集合读取）
+→ 检查空位/冲突、必要时创建 dummy 链
+→ map.UpdateEntry 将新版本置为链头
+→ 将旧 child 压入事务 Undo Buffer
 ```
 
-### 2.3 写写冲突检测
+旧文档把 AddObject 放在持双锁期间，还把 catalog_lock 称为读锁，都不符合当前实现。变量名 `read_lock` 不改变它是互斥锁的事实。
 
-当两个并发事务试图修改同一 Catalog 对象时，DuckDB 使用**乐观并发控制**检测冲突：
+### 3.2 ALTER / DROP
 
-```cpp
-bool CatalogSet::HasConflict(CatalogTransaction transaction, transaction_t timestamp) {
-    // 另一个活跃事务已修改此条目（未提交）
-    bool by_other_active = (timestamp >= TRANSACTION_ID_START &&
-                             timestamp != transaction.transaction_id);
-    // 另一个事务在本事务启动后提交了修改
-    bool committed_after = (timestamp < TRANSACTION_ID_START &&
-                             timestamp > transaction.start_time);
-    return by_other_active || committed_after;
-}
-```
+ALTER 创建新 CatalogEntry 版本并处理重命名、依赖更新和 Undo 信息；DROP 先检查并处理依赖，再持 Catalog 写锁和集合锁安装删除版本。锁并非贯穿整个用户事务，也不是所有事务只允许一个 DDL；它们保护具体元数据操作的临界区，版本冲突另行检测。
 
-如果检测到冲突，会抛出 `TransactionException`（write-write conflict），当前事务必须中止。
+普通查找/扫描也取得 `catalog_lock`，因此 MVCC 避免等候其他事务结束，不等于所有读操作完全无锁或永不阻塞。依赖调整可能访问多个集合，不能根据局部流程图推导任意外部调用的锁顺序。
 
-### 2.4 创建新条目的完整流程
+### 3.3 回滚与清理
 
-以 `CatalogSet::CreateEntry()` 为例（`src/catalog/catalog_set.cpp`）：
+[duck_transaction.cpp](../src/transaction/duck_transaction.cpp) 的 `PushCatalogEntry` 在 Undo 中记录旧 entry 指针与可选 ALTER 数据；[undo_buffer.cpp](../src/transaction/undo_buffer.cpp) 逆序 Rollback，由 [rollback_state.cpp](../src/transaction/rollback_state.cpp) 调用 `CatalogSet::Undo` 移除本事务新版本、恢复链。
 
-```
-1. 将新 entry 的 timestamp 设为 transaction.transaction_id（标记为"未提交"）
-2. 获取 DuckCatalog::write_lock（互斥写锁，防止并发写）
-3. 获取 CatalogSet::catalog_lock（读锁，防止读写竞争）
-4. 调用 DependencyManager::AddObject() 注册依赖关系
-5. 调用 CatalogEntryMap::UpdateEntry()，将新 entry 插入版本链头部
-6. 将旧 entry（child）压入事务的 Undo Buffer（用于回滚）
-```
+成功提交不会立即销毁所有旧版本；无快照仍需要时，cleanup 才调用 `CatalogSet::CleanupEntry`。已有读者仍可能需要历史 CatalogEntry。详见 [TRANSACTION_MVCC_DESIGN.md](TRANSACTION_MVCC_DESIGN.md)。
 
-### 2.5 Undo Buffer：支持回滚
+## 四、提交与依赖竞态检查
 
-`DuckTransaction` 内含一个 `UndoBuffer`，用于在事务回滚时还原 Catalog 状态。
+入口：[duck_transaction_manager.cpp](../src/transaction/duck_transaction_manager.cpp) 的 `CommitTransaction`；内存提交：[duck_transaction.cpp](../src/transaction/duck_transaction.cpp) 的 `WriteToWAL/Commit`；条目处理：[commit_state.cpp](../src/transaction/commit_state.cpp) 的 `CommitState::CommitEntry`。
 
-```cpp
-// src/include/duckdb/transaction/duck_transaction.hpp
-class DuckTransaction : public Transaction {
-    UndoBuffer undo_buffer;
-    void PushCatalogEntry(CatalogEntry &entry,
-                          data_ptr_t extra_data, idx_t extra_data_size);
-    ...
-};
-```
+1. 视 WAL/checkpoint 分支准备 LocalStorage 与 WAL，分配 commit_id。
+2. `UndoBuffer::Commit` 处理版本发布前的检查。
+3. 新建 SUBJECT 依赖记录调用 `VerifyExistenceOfDependency`；DROP 调用 `CommitDrop`，验证并发新增依赖。
+4. 持 Catalog 写锁与集合锁将新 entry timestamp 改为 commit_id；相关物理资源删除进入 CommitDropState。
+5. 有 WAL commit_state 时，成功处理 Undo 后 FlushCommit；之后 FinalizeCommit 释放延迟资源。
+6. 失败通过 RevertCommit/事务 Rollback 恢复；恢复本身失败可使数据库失效，不能承诺任何故障都无条件回滚成功。
 
-**回滚流程（`CatalogSet::Undo()`）：**
+提交验证有精确不同边界：
 
-```
-1. 从 Undo Buffer 取出被替换的旧 entry
-2. 调用 CatalogSet::Undo(old_entry)
-3. 在版本链中移除新 entry（由当前事务创建）
-4. 将旧 entry 恢复为 root（当前可见版本）
-```
+| 调用 | 构造的已提交视图 |
+|---|---|
+| `CatalogSet::VerifyExistenceOfDependency` | transaction_id=`MAX_TRANSACTION_ID`，bound=`Through(commit_id)`，包含当前 commit_id |
+| `CatalogSet::CommitDrop` | transaction_id=`MAX_TRANSACTION_ID`，bound=`Before(commit_id)`，不包含当前 commit_id |
 
-### 2.6 提交流程
+`DependencyManager::VerifyExistence` 除检查被删除，还对非 ownership 且保存了 subject OID 的记录验证身份，拒绝“同名对象被 drop/recreate”。`VerifyCommitDrop` 与原事务 visibility_bound 比较，拒绝快照之外新提交的依赖。更多见 [DEPENDENCY_MANAGER_DESIGN.md](DEPENDENCY_MANAGER_DESIGN.md)。
 
-```
-1. DuckTransaction::Commit() 被调用
-2. UndoBuffer::WriteToWAL()：将 Catalog 变更写入 WAL（Write-Ahead Log）
-3. UndoBuffer::Commit()：将所有 entry 的 timestamp 更新为 commit_id（< TRANSACTION_ID_START）
-4. DuckTransactionManager 更新 catalog_version（全局版本号）
-5. UndoBuffer::Cleanup()：清理不再需要的旧版本
-```
+## 五、WAL 与对象类型边界
 
----
+[wal_write_state.cpp](../src/transaction/wal_write_state.cpp) 的 `WriteCatalogEntry` 会跳过 entry 或其 parent 为 temporary 的记录，并按具体 CatalogType 写支持的记录。内存库、系统库、只读加载/恢复模式、自动 checkpoint 替代 WAL 等还影响是否实际写 WAL，不能概括为“每次 Catalog 修改都写日志”。
 
-## 三、WAL（Write-Ahead Log）与 Catalog
+[wal_type.hpp](../src/include/duckdb/common/enums/wal_type.hpp) 包含 CREATE/DROP TABLE、SCHEMA、VIEW、SEQUENCE、MACRO、TYPE、TABLE_MACRO、INDEX，ALTER_INFO，以及当前新增的 `CREATE_TRIGGER=30`、`DROP_TRIGGER=31`；WAL_FLUSH=100 是事务重放边界。无需把 SQL/内部所有 CatalogType 都假定映射为独立 WAL 类型。
 
-每次提交 Catalog 变更时，DuckDB 都会将操作记录到 WAL，以支持崩溃恢复。
+持久化加载还受目标 StorageVersion、Catalog 条目各自序列化逻辑和扩展可用性限制。头格式、并发 checkpoint、主/辅助 WAL 的恢复见 [STARTUP_AND_CRASH_RECOVERY_DESIGN.md](STARTUP_AND_CRASH_RECOVERY_DESIGN.md)。
 
-WAL 中 Catalog 相关的操作类型（`src/include/duckdb/common/enums/wal_type.hpp`）：
+## 六、依赖、嵌套 schema 与触发器
 
-| WAL 类型 | 值 | 说明 |
-|----------|----|------|
-| `CREATE_TABLE` | 1 | 创建表 |
-| `DROP_TABLE` | 2 | 删除表 |
-| `CREATE_SCHEMA` | 3 | 创建 Schema |
-| `DROP_SCHEMA` | 4 | 删除 Schema |
-| `CREATE_VIEW` | 5 | 创建视图 |
-| `DROP_VIEW` | 6 | 删除视图 |
-| *(7 号值不存在于枚举，为历史保留的空位)* | 7 | — |
-| `CREATE_SEQUENCE` | 8 | 创建序列 |
-| `DROP_SEQUENCE` | 9 | 删除序列 |
-| `SEQUENCE_VALUE` | 10 | 序列当前值更新 |
-| `CREATE_MACRO` | 11 | 创建宏 |
-| `DROP_MACRO` | 12 | 删除宏 |
-| `CREATE_TYPE` | 13 | 创建类型 |
-| `DROP_TYPE` | 14 | 删除类型 |
-| `ALTER_INFO` | 20 | 修改对象 |
-| `CREATE_TABLE_MACRO` | 21 | 创建表宏 |
-| `DROP_TABLE_MACRO` | 22 | 删除表宏 |
-| `CREATE_INDEX` | 23 | 创建索引 |
-| `DROP_INDEX` | 24 | 删除索引 |
+当前对象身份包含类型、`schema_path`（从外到内的包含 schema）、name，以及触发器的 owning table；不能只用一段 schema 字符串识别所有对象。依赖标志新增 ALTER_BLOCKING，DROP 与 ALTER 阻塞策略并不总是相同。
 
-**注意：** 标记了 `temporary = true` 的 Catalog 条目不会写入 WAL。
+`DuckSchemaEntry` 为表、索引、嵌套 schema 等建立相应依赖；Binder 为触发器和索引表达式收集实际依赖。不能仅从“视图查询了表”推导所有视图引用都被 DependencyManager 完整追踪，应该以创建路径提交的 LogicalDependencyList 为准。详见 [duck_schema_entry.cpp](../src/catalog/catalog_entry/duck_schema_entry.cpp)、[bind_create.cpp](../src/planner/binder/statement/bind_create.cpp)、[index_binder.cpp](../src/planner/expression_binder/index_binder.cpp)。
 
----
+## 七、扩展元数据管理建议
 
-## 四、依赖管理（DependencyManager）
+| 元数据 | 可复用的机制与限制 |
+|---|---|
+| 普通表中的数据 | 复用内置表 DML、约束、MVCC、WAL；仍需事务与持久库条件成立 |
+| 原生可持久化 Catalog 对象 | 复用对应对象实现的 Undo/依赖/序列化；新增类型需接入完整路径 |
+| 函数/类型注册 | 复用注册入口，不能据此假定函数指针可 WAL 序列化、重启自动恢复 |
+| 外部系统对象 / 自定义 Catalog | 由其 TransactionManager、存储与协调协议决定，不自动获得 DuckCatalog 的原子性 |
+| Secret Manager | 独立的 secret 存储语义，不等同于普通用户元数据表或通用事务容器 |
 
-`DependencyManager`（`src/include/duckdb/catalog/dependency_manager.hpp`）维护 Catalog 对象间的依赖关系，保证以下语义：
-
-- **级联删除（CASCADE）**：删除父对象时自动删除依赖对象
-- **阻止删除（RESTRICT）**：存在依赖时阻止删除父对象
-- **所有权（OWNERSHIP）**：一个对象"拥有"另一个对象（被拥有者随所有者生命周期）
-
-依赖关系本身也存储在两个 `CatalogSet` 中（`subjects`、`dependents`），因此**依赖关系的创建和删除也参与事务**，与普通 Catalog 操作具有相同的 ACID 语义。
-
----
-
-## 五、Catalog 条目类型
-
-DuckDB 支持以下 Catalog 对象类型（`src/include/duckdb/common/enums/catalog_type.hpp`）：
-
-| 类型 | 说明 |
-|------|------|
-| `TABLE_ENTRY` | 普通表 |
-| `SCHEMA_ENTRY` | Schema（命名空间） |
-| `VIEW_ENTRY` | 视图 |
-| `INDEX_ENTRY` | 索引 |
-| `SEQUENCE_ENTRY` | 序列 |
-| `TYPE_ENTRY` | 自定义类型 |
-| `SCALAR_FUNCTION_ENTRY` | 标量函数 |
-| `AGGREGATE_FUNCTION_ENTRY` | 聚合函数 |
-| `TABLE_FUNCTION_ENTRY` | 表值函数 |
-| `PRAGMA_FUNCTION_ENTRY` | Pragma 函数 |
-| `MACRO_ENTRY` / `TABLE_MACRO_ENTRY` | 宏 |
-| `COLLATION_ENTRY` | 排序规则 |
-| `DATABASE_ENTRY` | 附加数据库 |
-| `SECRET_ENTRY` | 密钥/认证信息 |
-| `DEPENDENCY_ENTRY` | 依赖关系（内部） |
-
----
-
-## 六、插件（Extension）元数据管理指南
-
-### 6.1 DuckDB 插件元数据现状
-
-插件可以通过以下方式与 Catalog 集成：
-
-1. **注册函数**（最常见）：通过 `CreateScalarFunction`、`CreateTableFunction` 等将函数注册到 Catalog，**自动获得事务支持**。
-2. **注册自定义类型**：通过 `CreateType` 注册类型，**自动获得事务支持**。
-3. **注册表**：插件可以通过 `CreateTable` 在用户 Schema 中创建元数据表。
-4. **使用 Secret Manager**：`duckdb_secrets` 系统表管理认证信息（如云存储的 key/secret）。
-
-### 6.2 是否需要在插件中自行实现事务支持？
-
-**结论：通常不需要。** 推荐复用 DuckDB 的 Catalog 事务机制。
-
-| 场景 | 建议 |
-|------|------|
-| 插件元数据是"函数/类型/视图"定义 | 直接注册到 DuckDB Catalog，自动获得 MVCC 和事务支持 |
-| 插件需要持久化少量配置/元数据 | 在用户 Schema 中创建普通表存储，使用标准 DML，享受完整事务语义 |
-| 插件需要持久化大量复杂状态 | 可以在内部使用 DuckDB 嵌入一个内存/文件数据库，或使用标准表 |
-| 插件元数据是临时的（进程生命周期内） | 注册 `temporary = true` 的 Catalog 条目，不写 WAL，不持久化 |
-| 插件需要管理外部系统的元数据 | 考虑使用 `AttachDatabase` 机制，或自行维护外部存储（这时需要自行实现事务） |
-
-### 6.3 推荐的插件元数据管理方案
-
-**方案 A（推荐）：将元数据存储在 DuckDB 表中**
+例如可选择普通表存储插件状态，以下仅是未经执行的 SQL 示意，不规定加载扩展时自动建表：
 
 ```sql
--- 在插件初始化时创建元数据表（在用户数据库中）
-CREATE TABLE IF NOT EXISTS my_extension_metadata (
-    key   VARCHAR PRIMARY KEY,
+CREATE SCHEMA IF NOT EXISTS extension_state;
+CREATE TABLE IF NOT EXISTS extension_state.metadata (
+    key VARCHAR PRIMARY KEY,
     value VARCHAR,
     updated_at TIMESTAMP DEFAULT now()
 );
 ```
 
-- 优点：完全复用 DuckDB 的 ACID 事务、WAL、MVCC
-- 缺点：元数据与用户数据混在一起（可通过独立 Schema 隔离）
-
-**方案 B：注册为 Catalog 对象**
-
-将插件自定义类型、函数、宏等直接通过 Catalog API 注册，DuckDB 会自动管理这些对象的生命周期和事务一致性。
-
-```cpp
-// 在插件加载时注册
-auto &catalog = Catalog::GetSystemCatalog(*db);
-catalog.CreateFunction(context, create_function_info);
-```
-
-**方案 C：使用独立附加数据库**
-
-对于需要隔离的插件元数据，可以附加一个专用数据库文件：
-
-```sql
-ATTACH 'my_extension_state.db' AS ext_db;
--- 之后所有写操作发生在 ext_db 中，有独立的事务和 WAL
-```
-
-### 6.4 需要自行实现事务的场景
-
-以下情况**可能需要**在插件中自行实现事务逻辑：
-
-1. **外部系统同步**：元数据需要与 DuckDB 外部的系统（如 Hive Metastore、外部注册中心）保持一致，需要实现两阶段提交或补偿事务。
-2. **自定义 Catalog 实现**：如果插件实现了自定义 `Catalog` 接口（如 `iceberg`、`postgres` 插件），需要在 `CreateEntry`/`AlterEntry`/`DropEntry` 中自行处理外部元数据事务。
-3. **高频写入元数据**：如果插件元数据写入频率极高，标准 Catalog 的写锁可能成为瓶颈，需要评估是否需要自定义并发控制。
-
----
-
-## 七、关键设计原则总结
-
-| 原则 | DuckDB 的实现 |
-|------|---------------|
-| **原子性（Atomicity）** | Undo Buffer 保证事务内所有 Catalog 变更要么全部提交，要么全部回滚 |
-| **一致性（Consistency）** | 写写冲突检测（`HasConflict`）+ DependencyManager 保证约束 |
-| **隔离性（Isolation）** | MVCC 版本链 + `start_time` 快照隔离，不同事务看到各自一致的视图 |
-| **持久性（Durability）** | 提交前写 WAL，崩溃后可通过 WAL 重放恢复 Catalog 状态 |
-| **并发写** | 同一时间只有一个事务能修改同一 Catalog 对象（乐观锁 + write_lock） |
-| **并发读** | MVCC 保证读操作无阻塞 |
-
----
-
-## 八、参考源码
-
-- `src/catalog/catalog_set.cpp` — MVCC 核心逻辑（`GetEntryForTransaction`, `Undo`, `CreateEntry`）
-- `src/transaction/duck_transaction.cpp` — 事务提交/回滚流程
-- `src/transaction/undo_buffer.cpp` — Undo Buffer 的写入与回滚
-- `src/transaction/commit_state.cpp` — 提交时的 WAL 写入
-- `src/transaction/rollback_state.cpp` — 回滚时恢复 Catalog 状态
-- `src/catalog/dependency_manager.cpp` — 依赖关系的事务性创建和删除
+使用附加数据库可隔离文件，但不能推导跨多个持久库的原子写入；`MetaTransaction::ModifyDatabase` 当前限制一个事务只修改一个普通 attached database，system/temp 例外。不存在可供扩展直接套用的全局两阶段提交保证。

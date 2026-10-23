@@ -1,449 +1,157 @@
 # DuckDB 并行 Scan 设计文档
 
-## 概述
+> 适用源码：`v2.0-cyanoptera` @ `c1cd2470a455`；核对日期：2026-10-23。核对方式：静态源码审查，未执行本文示例或性能测试。
 
-本文档整理了 DuckDB 存储引擎并行 Scan 的设计原理，涵盖并行调度层、内置存储引擎的 RowGroup 级并行机制、以及扩展（Extension）实现并行 Table Function 的设计规范与注意事项，为编写支持并行扫描的插件提供参考。
+## 概述与入口
 
----
+并行扫描依赖两层分工：Pipeline 决定可并发的执行实例数；具体 Source 在这些实例之间领取工作，并维护每个实例的扫描位置。内置表扫描、索引扫描、多文件扫描的工作粒度不同，不能统一描述成每线程固定一个 RowGroup。
 
-## 一、相关源码文件
+| 层次 | 源码与关键符号 |
+|---|---|
+| 扫描任务数 | [pipeline.cpp](../src/parallel/pipeline.cpp)：`TryGetMaxThreads`、`ScheduleParallel`、`LaunchScanTasks` |
+| 表函数适配 | [physical_table_scan.cpp](../src/execution/operator/scan/physical_table_scan.cpp)：`TableScanGlobalSourceState`、`TableScanLocalSourceState`、`GetDataInternal` |
+| 扩展接口 | [table_function.hpp](../src/include/duckdb/function/table_function.hpp)：`GlobalTableFunctionState`、`TableFunctionInput` |
+| 内置扫描 | [table_scan.cpp](../src/function/table/table_scan.cpp)：`DuckTableScanState`、`DuckIndexScanState`、`DuckTableScanInitGlobal` |
+| 工作领取 | [data_table.cpp](../src/storage/data_table.cpp)：`MaxThreads`、`NextParallelScan`；[row_group_collection.cpp](../src/storage/table/row_group_collection.cpp)：`NextParallelScan` |
+| 状态与预取 | [scan_state.hpp](../src/include/duckdb/storage/table/scan_state.hpp)：`ParallelCollectionScanState`、`ParallelTableScanState`；[scan_read_ahead.cpp](../src/parallel/scan_read_ahead.cpp)：`AcquireJob` |
 
-| 文件 | 说明 |
-|------|------|
-| `src/parallel/pipeline.cpp` | Pipeline 并行调度，决定线程数量与任务分发 |
-| `src/execution/operator/scan/physical_table_scan.cpp` | PhysicalTableScan 的全局/本地状态初始化与数据获取 |
-| `src/include/duckdb/execution/operator/scan/physical_table_scan.hpp` | PhysicalTableScan 头文件 |
-| `src/include/duckdb/function/table_function.hpp` | TableFunction 所有回调接口声明 |
-| `src/include/duckdb/storage/table/scan_state.hpp` | 扫描状态结构体：CollectionScanState、ParallelCollectionScanState 等 |
-| `src/storage/table/row_group_collection.cpp` | RowGroupCollection 并行扫描核心逻辑 |
-| `src/storage/data_table.cpp` | DataTable::MaxThreads / InitializeParallelScan / NextParallelScan |
-| `src/function/table/table_scan.cpp` | 内置表扫描的 GlobalState / LocalState / ScanFunc 实现 |
-| `src/function/table/arrow.cpp` | Arrow Scanner 并行实现参考 |
-| `src/include/duckdb/common/multi_file/multi_file_states.hpp` | MultiFileGlobalState / MaxThreads 参考实现 |
+## 一、Pipeline 的并行度上限
 
----
+普通 Source 驱动的 Pipeline 在 `Pipeline::Schedule` 中初始化全局状态后，调用 `TryGetMaxThreads`：检查 Source/Sink/中间算子的并行能力，从 Source 的 MaxThreads 开始，叠加中间全局状态限制、regular 调度线程数和 Sink 全局状态限制。最终上限不超过 regular 线程数。Sink 需要批次索引时还检查 Source 的分区信息支持。
 
-## 二、并行执行总体架构
+`LaunchScanTasks` 在上限大于 1 时创建多个 `PipelineTask`，否则回退到一个任务。它创建的是任务而非专属线程。任务因预算耗尽重新排队或阻塞唤醒后，可能迁移到不同 OS 线程。
 
-DuckDB 的并行 Scan 建立在 **Pipeline 执行模型**之上，通过 **全局/本地状态分离（Global/Local State）** 来实现多线程并发读取数据。
+`PhysicalTableScan::ParallelSource()` 在存在普通 `function` 时返回 true；只有 in-out 回调的 PhysicalTableScan 返回 false，因为此适配器的输入只有一行参数。这不表示所有关系输入的 in-out 算子都不能并行，后者使用 [physical_tableinout_function.cpp](../src/execution/operator/projection/physical_tableinout_function.cpp) 的独立实现。
 
-```
-┌─────────────────────────────────────────────────────────────┐
-│                      Pipeline 调度层                         │
-│  Pipeline::ScheduleParallel()                               │
-│    → source->ParallelSource()   // 是否支持并行             │
-│    → source_state->MaxThreads() // 最大线程数               │
-│    → LaunchScanTasks(N)         // 启动 N 个 PipelineTask    │
-└──────────────────────────┬──────────────────────────────────┘
-                           │ N 个并发线程
-           ┌───────────────┼───────────────┐
-           ▼               ▼               ▼
-    ┌─────────────┐ ┌─────────────┐ ┌─────────────┐
-    │ Thread 1    │ │ Thread 2    │ │ Thread N    │
-    │ LocalState  │ │ LocalState  │ │ LocalState  │
-    └──────┬──────┘ └──────┬──────┘ └──────┬──────┘
-           │               │               │
-           └───────────────┼───────────────┘
-                           │ 原子领取任务（加锁）
-                           ▼
-                   ┌───────────────┐
-                   │ GlobalState   │
-                   │ 任务队列/指针  │
-                   │ mutex 保护    │
-                   └───────────────┘
+`PhysicalTableScan::SourceParallelism()` 返回 `function.parallelism`，其枚举包括 SELF_MANAGED_PARALLELISM（默认）、SEQUENTIAL、FORCE_SINGLE_THREADED。它是能力声明，不能代替上述 `MaxThreads` 与 Pipeline 检查，亦不能仅据其名称推断实际线程数。
+
+## 二、Global/Local 状态和空状态
+
+普通路径中，`TableScanGlobalSourceState` 调用可选 `init_global`，取得状态并缓存其 `MaxThreads()`。无回调时最大线程数为 1，表函数 global_state 可以为空；有回调但返回空状态时内部初值仍为 0，最终扫描调度仍会回退单任务，不能把返回空指针用作跳过扫描的协议。
+
+`PipelineTask` 懒构造 `PipelineExecutor`，随后由 `GetLocalSourceState` 调用可选 `init_local`。因此 local 初始化按执行实例发生，并可能彼此并发；不是 OS 线程启动时只调用一次。状态重建/复用还受重复执行和 Reset 机制影响。
+
+**`init_local` 返回 nullptr 不会使框架跳过 `function`。** `TableScanLocalSourceState` 保存这个空指针，`GetDataInternal` 仍把它传入 `TableFunctionInput`。如果扫描回调需要 Cast 本地状态，必须返回一个有效的状态对象，并在其中标记无工作。状态确实可选的函数则可以自行处理空指针。
+
+```text
+多个 PipelineTask
+  ├─ 各自 PipelineExecutor / LocalSourceState / LocalTableFunctionState
+  └─ 共享 GlobalSourceState / GlobalTableFunctionState
+         └─ 由扫描器使用锁、原子操作或其他同步方式分配工作
 ```
 
-**核心设计原则：**
-- **全局状态（GlobalTableFunctionState）**：所有线程共享，存放"待读任务队列"（如哪些 RowGroup 还未被扫描），通过 mutex 保护并发访问。
-- **本地状态（LocalTableFunctionState）**：每个工作线程独占，存放当前线程正在扫描的位置，无锁读取。
+本地状态不会被多个正常 PipelineTask 同时共享，但可被同一任务先后在不同线程使用；异步 I/O 也可能访问它引用的数据。只有在没有这些并发访问时才可省略同步，不能把 local 理解成任意线程安全保证。bind_data 在执行回调中以 const 指针暴露，可变运行状态应放到 global/local 对象。
 
----
+## 三、内置存储的工作领取
 
-## 三、Pipeline 调度层
+### 3.1 工作量与线程数估计
 
-### 3.1 并行条件检查（`src/parallel/pipeline.cpp`）
+[DataTable::MaxThreads](../src/storage/data_table.cpp) 使用以下简化公式；代码骨架省略了事务本地数据获取细节，未编译运行：
 
-```cpp
-bool Pipeline::ScheduleParallel(shared_ptr<Event> &event) {
-    // 1. Sink 必须支持并行
-    if (!sink->ParallelSink()) return false;
-    // 2. Source 必须支持并行
-    if (!source->ParallelSource()) return false;
-    // 3. 获取最大线程数（来自 GlobalSourceState::MaxThreads）
-    auto max_threads = source_state->MaxThreads();
-    // 4. 中间算子也必须支持并行
-    for (auto &op : operators) {
-        if (!op.ParallelOperator()) return false;
-        max_threads = min(max_threads, op.op_state->MaxThreads(max_threads));
-    }
-    // 5. 不超过活跃线程数和 Sink 的约束
-    max_threads = min(max_threads, scheduler.NumberOfThreads());
-    max_threads = min(max_threads, sink->sink_state->MaxThreads(max_threads));
-    return LaunchScanTasks(event, max_threads);
-}
+```text
+vector_count = verify_parallelism ? 1 : GetRowGroupSize() / STANDARD_VECTOR_SIZE
+assignment_scale = STANDARD_VECTOR_SIZE * vector_count
+total = 基表行数 + 当前事务 LocalStorage 行数
+max_threads = total / assignment_scale + 1
 ```
 
-`PhysicalTableScan::ParallelSource()` 的逻辑：只要 `function.function` 不为空（普通 Table Function 而非 in-out function），即返回 `true`。
+`GetRowGroupSize()` 来自表的存储配置，不能把所有 RowGroup 固定写成 122880 行。verify_parallelism 模式下领取范围细化为一个 STANDARD_VECTOR_SIZE；此处是调试切分工作，不保证每次切分都发生 OS 线程切换。
 
-### 3.2 状态初始化
+### 3.2 ParallelCollectionScanState
 
-```
-// 每个 pipeline 执行前调用一次（单线程）
-PhysicalTableScan::GetGlobalSourceState()
-  → function.init_global(context, input) → GlobalTableFunctionState
-  → max_threads = global_state->MaxThreads()
+当前状态保存 collection、共享 row_groups 树、current_row_group、vector_index、max_row、batch_index、原子 skipped_rows、可选 row_number_base、mutex、可选 reorderer 和 partitions_to_scan。旧文档的 `processed_rows` 字段已经不存在。
 
-// 每个工作线程独立调用
-PhysicalTableScan::GetLocalSourceState()
-  → function.init_local(context, input, global_state) → LocalTableFunctionState
-```
+[RowGroupCollection::NextParallelScan](../src/storage/table/row_group_collection.cpp) 的返回值是 **optional_idx**：有效时表示领取范围的行数，无效时无更多工作。应以 `IsValid()` 判断，不是 bool/“rows == 0”接口。
 
-### 3.3 数据获取
+其工作流为：
 
-```
-// 多线程并发调用
-PhysicalTableScan::GetDataInternal()
-  → function.function(context, {bind_data, local_state, global_state}, chunk)
-```
+1. 共享 row-group 树到局部 CollectionScanState。
+2. 在全局状态锁内选定下一个 RowGroup 或调试 vector 范围，推进全局指针并分配 batch index；可为可见行号预留范围。
+3. 锁外调用 `InitializeScanInRowGroup`，由 `initialize_columns` 控制是否同时初始化列扫描。
+4. 若该范围被过滤掉，给 skipped_rows 加上范围行数并继续领取；成功则返回 assignment_rows，耗尽则返回无效 optional_idx。
 
----
+锁保护领取阶段；不能据此声称整个扫描完全无锁。列读取、缓冲管理和事务可见性有各自同步机制。
 
-## 四、内置存储引擎的并行 Scan
+### 3.3 基表与事务本地数据
 
-### 4.1 存储结构
+`ParallelTableScanState` 持有基表和事务 LocalStorage 两个 ParallelCollectionScanState。`DataTable::NextParallelScan` 先领取基表，耗尽后转到事务本地集合；需要行号时还传递基表行号基准。**事务本地集合也可并行扫描**，不可把它统称“最后由固定线程串行读取”。索引扫描的 LocalStorage 尾段则有自己的一名逻辑执行者，见后文。
 
-```
-DataTable
-  └─ RowGroupCollection
-       └─ RowGroupSegmentTree  (RowGroup 链表)
-            └─ RowGroup[]      (每个 RowGroup 默认 122880 行)
-                 └─ ColumnData[]
-                      └─ ColumnSegment[]  (压缩数据块)
-```
+头文件仍声明了 `ParallelTableScanState::checkpoint_lock`，但当前 `DataTable::InitializeParallelScan` 只初始化两个集合，本文核对的调用链没有给该字段赋值。因此不能凭字段注释断言每次普通扫描都持有该锁，更不能据此提出扩展的持锁规范；完整 checkpoint/MVCC 保活需沿事务和存储对象生命周期另行核对。
 
-**并行的粒度是 RowGroup**：每个线程每次领取一个 RowGroup 进行扫描。
+## 四、2.0 内置 TableScan 的扫描与 I/O
 
-### 4.2 并行状态结构（`src/include/duckdb/storage/table/scan_state.hpp`）
+### 4.1 无读前预取时
 
-```cpp
-// 多线程共享的全局并行状态
-struct ParallelCollectionScanState {
-    RowGroupCollection *collection;
-    shared_ptr<RowGroupSegmentTree> row_groups;
-    optional_ptr<SegmentNode<RowGroup>> current_row_group; // 下一个待领取的 RowGroup 指针
-    idx_t vector_index;          // verify_parallelism 模式下用于更细粒度切分
-    idx_t max_row;
-    idx_t batch_index;           // 单调递增，标记批次顺序（用于保序写入）
-    atomic<idx_t> processed_rows;// 已处理行数（进度显示用）
-    mutex lock;                  // 保护 current_row_group 的并发访问
-};
+[DuckTableScanState](../src/function/table/table_scan.cpp) 保存 ParallelTableScanState、存储列映射和过滤信息。本地状态保存 TableScanState、投影缓冲、当前 assignment 的进度。`InitLocalState` 在无 read_ahead 时通过 `ClaimAssignment` 领取初始范围。
 
-// 包含持久化数据和事务本地数据两个并行状态
-struct ParallelTableScanState {
-    ParallelCollectionScanState scan_state;   // 持久化数据的并行状态
-    ParallelCollectionScanState local_state;  // 事务本地数据的并行状态
-    shared_ptr<CheckpointLock> checkpoint_lock; // 防止扫描期间 checkpoint
-};
+`ScanPersistentStorage` 把一个持久化 vector 的工作分为：
+
+```text
+CollectionScanState::PrepareScanIO
+   → AsyncResult::FromTasks(io_tasks, ASYNC)
+   → 有任务时 TableFunctionInput::HandleBlocked
+   → ProcessPreparedScan 解码已准备的 vector
+   → 输出非空：返回；全过滤：NEXT_VECTOR 并检查中断
 ```
 
-### 4.3 核心并行方法
+TASK_EXECUTOR 可以让有任务的 I/O 以 BLOCKED 上浮；SYNCHRONOUS 由 HandleBlocked 就地执行任务。恢复后沿已准备的扫描状态解码，不应重新登记同一批 I/O。持久化范围耗尽时 `storage.Scan` 还处理已领取的本地存储部分。整个范围没有输出后再 `ClaimAssignment` 领取下一个范围；TASK_EXECUTOR 可显式返回空的 HAVE_MORE_OUTPUT，SYNCHRONOUS 则内部继续直到输出或耗尽。
 
-**初始化**（`DataTable::InitializeParallelScan`）：
-```cpp
-void DataTable::InitializeParallelScan(ClientContext &context,
-                                        ParallelTableScanState &state, ...) {
-    row_groups->InitializeParallelScan(state.scan_state);    // 持久化数据
-    local_storage.InitializeParallelScan(*this, state.local_state); // 事务本地
-}
+### 4.2 ScanReadAhead 路径
 
-void RowGroupCollection::InitializeParallelScan(ParallelCollectionScanState &state) {
-    state.collection = this;
-    state.row_groups = GetRowGroups();
-    state.current_row_group = state.GetRootSegment(*state.row_groups);
-    state.max_row = base_row_id + total_rows;
-    state.batch_index = 0;
-    state.processed_rows = 0;
-}
+`DuckTableScanInitGlobal` 在非创建索引、非 repeatable percentage sample 时尝试创建 read-ahead；`CreateTableScanReadAhead` 还检查 BlockManager 的 Prefetch 能力，`ScanReadAhead::Create` 检查 async 线程数和 read_ahead_depth。存在 TASK_EXECUTOR 并不代表必定启用 read-ahead。
+
+`ProduceJob` 从状态池取一个扫描状态，持 `read_ahead_lock` 领取范围并分配连续 job batch index，然后在锁外初始化列并登记 I/O。`ScanReadAhead` 调度提前的 I/O，`ScanWithReadAhead` 领取 job 并解码。若 I/O 未完成且可以回调，可登记唤醒并返回**不带任务列表的 BLOCKED**；恢复后 WaitForJob，继续同一个 job。
+
+job 耗尽时累计进度、释放 pins，再把扫描状态放回池。领取范围、job 生产、I/O 任务、vector 解码、PipelineTask 调度是不同粒度；RowGroup 不是这些层次共同的调度单位。
+
+### 4.3 索引与多文件不是同一粒度
+
+`DuckIndexScanState::TableScanFunc` 对匹配 rowid 以 STANDARD_VECTOR_SIZE 批次领取基表 fetch 工作，再由一名逻辑执行者负责事务 LocalStorage 尾段；该执行实例仍可迁移 OS 线程。
+
+[MultiFileFunction](../src/include/duckdb/common/multi_file/multi_file_function.hpp) 使用文件状态和 reader 定义的 job/scan state；`ProduceJob`、`AcquireNextPerThread`、`AcquireNextReadAhead` 和 `DecodeCurrentJob` 分离领取、I/O、解码，不能归纳为“多文件扫描只支持文件级并行”。
+
+## 五、实现并行 TableFunction 的骨架
+
+下面是同步扫描器的**伪代码**，省略绑定、reader 定义、类型适配和错误处理，未编译运行。`init_global`/`init_local` 在接口上都可选；需要共享分工和局部 reader 的实现才需要提供它们。
+
+```text
+GlobalState:
+  files                         // 初始化后只读
+  atomic next = 0
+  MaxThreads() = max(1, files.size())  // 上限，并不预先创建线程
+
+LocalState:
+  reader = null
+  exhausted = false
+
+init_local:
+  返回有效 LocalState；不要求此时就领取工作
+
+function(data, output):
+  loop:
+    如果 reader 不存在:
+      index = global.next.fetch_add(1)
+      如果 index 越界: exhausted = true; return（IMPLICIT + 空块 = EOF）
+      reader = open(files[index])
+    reader.read(output)
+    如果 output 非空: return（保持 IMPLICIT）
+    reader = null               // 当前文件读完，继续领取，不伪装成 EOF
 ```
 
-**领取下一个 RowGroup**（`RowGroupCollection::NextParallelScan`）：
-```cpp
-bool RowGroupCollection::NextParallelScan(ClientContext &context,
-                                           ParallelCollectionScanState &state,
-                                           CollectionScanState &scan_state) {
-    while (true) {
-        optional_ptr<SegmentNode<RowGroup>> row_group;
-        {
-            lock_guard<mutex> l(state.lock);  // 加锁领取工作单元
-            if (!state.current_row_group) break; // 无更多数据
+原子计数器可以分配不重叠工作，mutex 可以保护复杂共享队列，只读文件列表不需要每次读取都加锁。若显式返回空 HAVE_MORE_OUTPUT，必须遵守 TASK_EXECUTOR 的结果协议；SYNCHRONOUS 下该组合会抛异常。
 
-            row_group = state.current_row_group;
-            state.processed_rows += row_group->GetNode().count;
-            state.current_row_group = GetNextRowGroup(*state.row_groups, *row_group);
-            scan_state.batch_index = ++state.batch_index;
-        }
-        // 临界区外执行初始化（无锁）
-        bool need_to_scan = InitializeScanInRowGroup(context, scan_state, ..., *row_group, ...);
-        if (need_to_scan) return true;
-        // 统计信息可以过滤掉整个 RowGroup，则继续领取下一个
-    }
-    return false;
-}
-```
+仅在实现真正支持时设置 projection_pushdown、filter_pushdown、filter_prune。尤其 filter_pushdown 会把正确过滤的责任交给扫描器，忽略 filters 可能产生错误结果，不能指望框架再补一个同样的过滤算子。参见 [TableFunction 接口](TABLE_FUNCTION_DESIGN.md)。
 
-**最大线程数计算**（`DataTable::MaxThreads`）：
-```cpp
-idx_t DataTable::MaxThreads(ClientContext &context) const {
-    idx_t row_group_size = GetRowGroupSize(); // 默认 122880
-    idx_t parallel_scan_tuple_count = STANDARD_VECTOR_SIZE * (row_group_size / STANDARD_VECTOR_SIZE);
-    return GetTotalRows() / parallel_scan_tuple_count + 1;
-    // 近似等于 RowGroup 数量 + 1
-}
-```
+## 六、C API 的状态获取边界
 
-### 4.4 内置 Scan 执行流（`src/function/table/table_scan.cpp`）
+实现现位于 [src/main/capi/v1/table_function-c.cpp](../src/main/capi/v1/table_function-c.cpp)：`CTableFunctionInit`、`CTableFunctionLocalInit`、`CTableFunction`。C 端在 global init 中调用 `duckdb_init_set_max_threads`，缺省为 1。
 
-```
-init_global (DuckTableScanState):
-  → storage.InitializeParallelScan(state, column_indexes)
-  → state.max_threads = storage.MaxThreads(context)
+`duckdb_init_get_bind_data(info)` **始终返回 bind data**，在 local init 中也不变；不能将它强转为 global init 分配的执行状态。实际扫描回调可分别用 `duckdb_function_get_init_data`、`duckdb_function_get_local_init_data` 取得 global/local init 数据。当前 local-init 包装器也没有把 C++ `gstate` 作为独立 C 参数传给用户回调，因此原先“local init 取 bind data 当 global queue”的示例已移除。需要共享分工时可在扫描回调取得 global init 数据后领取，并确保该数据并发安全。
 
-init_local (TableScanLocalState):
-  → 将 ColumnIndex 转换为 StorageIndex
-  → scan_state.Initialize(storage_ids, ...)
-  → rows_in_current_row_group = storage.NextParallelScan(...)  // 领取第一个 RowGroup
+## 七、EOF、顺序与验收边界
 
-function (DuckTableScanState::TableScanFunc):
-  → storage.Scan(tx, output, l_state.scan_state)               // 扫描当前 RowGroup
-  → if output.size() == 0:
-      → storage.NextParallelScan(context, state, scan_state)   // 领取下一个 RowGroup
-      → if rows == 0: return (所有数据已读完)
-```
-
----
-
-## 五、插件（Extension）实现并行 Scan
-
-### 5.1 必须实现的回调函数
-
-| 回调 | 必要性 | 说明 |
-|------|--------|------|
-| `bind` | 必须 | 绑定参数，返回列定义，创建 `FunctionData`（只读，bind 后不可修改） |
-| `init_global` | **必须（支持并行）** | 创建全局状态，初始化任务队列，**重写 `MaxThreads()`** |
-| `init_local` | **必须（支持并行）** | 每个线程调用一次，领取初始工作单元，创建线程本地扫描状态 |
-| `function` | 必须 | 主扫描函数，无锁读取本地状态数据，通过全局状态领取新任务 |
-
-### 5.2 代码框架（C++ 扩展）
-
-```cpp
-// ─── 1. 绑定数据（常量，bind 后不可修改） ───────────────────────────────
-struct MyBindData : public FunctionData {
-    vector<string> files;  // 数据源描述（例如文件列表）
-
-    unique_ptr<FunctionData> Copy() const override {
-        auto result = make_uniq<MyBindData>();
-        result->files = files;
-        return std::move(result);
-    }
-    bool Equals(const FunctionData &other) const override {
-        auto &o = other.Cast<MyBindData>();
-        return files == o.files;
-    }
-};
-
-// ─── 2. 全局状态 —— 存放待扫描的任务队列，线程共享 ─────────────────────
-struct MyGlobalState : public GlobalTableFunctionState {
-    mutex lock;
-    vector<string> files;
-    atomic<idx_t> next_file_index {0};  // 原子计数器，保护并发领取
-
-    idx_t MaxThreads() const override {
-        // 返回最大并行线程数，通常等于数据分片数（文件数/分区数等）
-        return files.size();
-    }
-};
-
-// ─── 3. 本地状态 —— 每个线程独占，存放当前扫描位置 ─────────────────────
-struct MyLocalState : public LocalTableFunctionState {
-    idx_t file_index = DConstants::INVALID_INDEX;
-    idx_t batch_index = 0;
-    unique_ptr<MyFileReader> reader;  // 当前文件的读取句柄
-};
-
-// ─── 4. 全局初始化（pipeline 开始时调用一次）────────────────────────────
-static unique_ptr<GlobalTableFunctionState> MyInitGlobal(
-        ClientContext &context, TableFunctionInitInput &input) {
-    auto &bind_data = input.bind_data->Cast<MyBindData>();
-    auto state = make_uniq<MyGlobalState>();
-    state->files = bind_data.files;
-    return std::move(state);
-}
-
-// ─── 5. 本地初始化（每个线程调用一次）──────────────────────────────────
-static unique_ptr<LocalTableFunctionState> MyInitLocal(
-        ExecutionContext &context, TableFunctionInitInput &input,
-        GlobalTableFunctionState *g_state) {
-    auto &global = g_state->Cast<MyGlobalState>();
-    auto local = make_uniq<MyLocalState>();
-
-    // 领取第一个工作单元
-    idx_t idx = global.next_file_index.fetch_add(1);
-    if (idx < global.files.size()) {
-        local->file_index = idx;
-        local->reader = OpenFile(context.client, global.files[idx]);
-        local->batch_index = idx;
-    }
-    // 如果没有工作可领取，返回 nullptr 或空状态均可（该线程不参与扫描）
-    return std::move(local);
-}
-
-// ─── 6. 主扫描函数（多线程并发调用） ───────────────────────────────────
-static void MyScanFunction(
-        ClientContext &context, TableFunctionInput &data_p, DataChunk &output) {
-    auto &global = data_p.global_state->Cast<MyGlobalState>();
-    auto &local = data_p.local_state->Cast<MyLocalState>();
-
-    while (true) {
-        if (local.file_index == DConstants::INVALID_INDEX) {
-            return; // 没有更多工作，返回空 chunk 表示结束
-        }
-
-        // 从本地 reader 读取数据（无锁）
-        local.reader->ReadChunk(output);
-        if (output.size() > 0) return;
-
-        // 当前文件读完，领取下一个文件
-        idx_t next = global.next_file_index.fetch_add(1);
-        if (next >= global.files.size()) {
-            local.file_index = DConstants::INVALID_INDEX;
-            return; // 所有文件处理完毕，返回空 chunk
-        }
-        local.file_index = next;
-        local.batch_index = next;
-        local.reader = OpenFile(context, global.files[next]);
-    }
-}
-
-// ─── 7. 注册 TableFunction ───────────────────────────────────────────
-TableFunction CreateMyTableFunction() {
-    TableFunction tf("my_scan", {LogicalType::VARCHAR},
-                     MyScanFunction,
-                     MyBindFunction,
-                     MyInitGlobal,
-                     MyInitLocal);
-    tf.projection_pushdown = true;  // 启用列裁剪
-    tf.filter_pushdown = true;      // 启用过滤下推
-    return tf;
-}
-```
-
-### 5.3 C API 实现并行 Scan
-
-通过 C API（`duckdb.h`）开发的扩展，需在 `init` 回调中显式设置最大线程数：
-
-```c
-void my_init(duckdb_init_info info) {
-    // 获取 bind 数据
-    MyBindData *bind_data = (MyBindData *)duckdb_init_get_bind_data(info);
-
-    // 关键：设置最大线程数，否则默认为 1（串行执行）
-    duckdb_init_set_max_threads(info, bind_data->num_partitions);
-
-    // 初始化全局状态
-    MyGlobalState *state = malloc(sizeof(MyGlobalState));
-    state->next_index = 0;
-    duckdb_init_set_init_data(info, state, free);
-}
-
-// local_init 中领取工作单元
-void my_local_init(duckdb_init_info info) {
-    MyGlobalState *global = (MyGlobalState *)duckdb_init_get_bind_data(info);
-    MyLocalState *local = malloc(sizeof(MyLocalState));
-    // 原子领取
-    local->file_index = atomic_fetch_add(&global->next_index, 1);
-    duckdb_init_set_init_data(info, local, free);
-}
-```
-
----
-
-## 六、注意事项与常见陷阱
-
-### 6.1 线程安全
-- **全局状态必须加锁**：`GlobalTableFunctionState` 会被多个线程并发访问，任何共享状态的读写都需要 mutex 保护。
-- **本地状态无需加锁**：`LocalTableFunctionState` 每个线程独享，可直接读写。
-- **bind_data 是只读的**：`FunctionData` 在 bind 后就不可修改；`function` 回调中获取到的是 `const FunctionData *`，不应绕过强转来写入。
-
-### 6.2 MaxThreads 的返回值
-- `MaxThreads()` 返回的是**建议**的最大线程数，调度器会取 `min(MaxThreads, active_threads)`。
-- 返回 `GlobalTableFunctionState::MAX_THREADS`（= 999999999）表示"尽可能多的线程"。
-- 建议返回实际**数据分片数**（文件数、分区数、RowGroup 数等），避免线程空转。
-
-### 6.3 init_local 返回 nullptr
-`init_local` 如果返回 `nullptr`，该线程不参与扫描（DuckDB 会跳过对该线程的 `function` 调用）。
-
-### 6.4 空 DataChunk 代表结束
-`function` 回调返回空 chunk（`output.size() == 0`）时，DuckDB 认为该线程的数据已全部返回。因此**不能**在还有数据时返回空 chunk，也不应该在数据读完之前返回非空 chunk 之后再多轮返回空 chunk（否则会导致提前结束）。
-
-### 6.5 in-out function 不支持并行
-`function.in_out_function` 类型的 Table Function（既有输入又有输出的流式算子），`PhysicalTableScan::ParallelSource()` 返回 `false`，不支持并行执行。只有普通 `function` 才能并行。
-
-### 6.6 batch_index 与有序写入
-- `batch_index` 是一个全局单调递增的整数，在并行扫描中由全局状态统一分配。
-- 若下游 Sink 需要保序输出（如 `INSERT INTO ... SELECT ... ORDER BY` 或 Batch Insert），需要实现 `get_partition_data` 回调，返回本地线程的 `batch_index`，DuckDB 会据此还原 RowGroup 的原始顺序。
-
-### 6.7 CheckpointLock（内置表扫描）
-内置表扫描在执行期间持有 `CheckpointLock`，防止扫描进行中发生 checkpoint（否则数据页可能被回收）。自定义 Table Function 如需访问 DuckDB 持久化存储（而非外部数据），也应考虑类似的并发保护。
-
-### 6.8 verify_parallelism 调试模式
-开启 `SET verify_parallelism = true` 后，内置表扫描的调度粒度从 RowGroup 细化为单个 Vector（2048 行），强制触发更多线程切换，便于测试并行正确性。
-
-### 6.9 MVCC 与事务本地数据
-内置表扫描需要扫描两个状态：
-- `scan_state.table_state`：已持久化/提交的数据（RowGroup Collection）。
-- `scan_state.local_state`：当前事务本地未提交的写入（LocalStorage）。
-
-自定义 Table Function 一般不涉及 MVCC，但若需要读取 DuckDB 内部事务数据，应通过 `DuckTransaction::Get(context, catalog)` 获取事务对象，并使用 `LocalStorage` 相关接口。
-
----
-
-## 七、各类并行 Scan 模式对比
-
-| 模式 | 实现位置 | 并行粒度 | 适用场景 |
-|------|---------|---------|---------|
-| 内置表扫描 | `src/function/table/table_scan.cpp` | RowGroup（默认 ~122k 行） | DuckDB 原生表 |
-| Arrow Scanner | `src/function/table/arrow.cpp` | Arrow Chunk（每次 GetNextChunk） | Arrow IPC Stream |
-| Multi-File Reader | `src/include/duckdb/common/multi_file/` | 文件级 | Parquet/CSV/JSON 多文件扫描 |
-| Index Scan | `src/function/table/table_scan.cpp` | STANDARD_VECTOR_SIZE 批次 | 索引查找后的存储行获取 |
-| 自定义扩展 | 扩展中实现 | 自定义（文件/分片/分区） | 外部存储系统、对象存储等 |
-
----
-
-## 八、调用时序总结
-
-```
-SQL 执行
-    │
-    ▼
-Planner → PhysicalTableScan 物理计划节点
-    │
-    ▼
-Pipeline::ScheduleParallel()
-  → GetGlobalSourceState()    // 单线程，调用 init_global
-      → function.init_global(context, input)
-      → MaxThreads() → 决定线程数 N
-    │
-    ▼ 启动 N 个 PipelineTask（并发）
-    │
-    ├─ Thread 1: GetLocalSourceState()
-    │              → function.init_local(ctx, input, g_state)  // 领取第一个工作单元
-    │            GetDataInternal() 循环调用直到返回空 chunk
-    │              → function.function(ctx, {bind, local, global}, chunk)
-    │
-    ├─ Thread 2: 同上
-    │
-    └─ Thread N: 同上
-    │
-    ▼
-所有线程完成 → Pipeline 结束
-```
+- IMPLICIT + 空块表示当前执行实例 EOF；暂时无输出但仍有工作时，不能沿用这个组合。
+- 显式 FINISHED/HAVE_MORE_OUTPUT/BLOCKED 的合法块大小由当前 execution strategy 校验，详见[异步扫描](ASYNC_TABLE_SCAN_DESIGN.md)。
+- 下游需要 batch index 时实现 get_partition_data，并保证索引与领取/输出顺序契合。PhysicalTableScan 的 SupportsPartitioning 当前只检查回调是否存在，源码仍留 FIXME，不能视为框架已经验证所有分区能力。
+- MaxThreads 是上限；空数据源也应能以一个局部状态正确返回 EOF，不能依赖“零任务”阻止错误回调。
+- 本文未运行并发、取消、过滤、顺序或性能测试；“可并行”的静态实现不等于运行时并行验收。

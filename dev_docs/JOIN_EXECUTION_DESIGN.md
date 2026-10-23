@@ -1,201 +1,109 @@
 # DuckDB Join 算子实现与执行过程整理
 
-## 1. 范围
+> 适用源码：`v2.0-cyanoptera` @ `c1cd2470a455`；核对日期：2026-10-23。核对方式：静态源码审查，未执行本文示例或性能测试。
 
-本文聚焦 DuckDB 执行层 Join：
+## 一、范围与执行框架
 
-- 重点：物理 Join 算子的实现与执行过程（Sink / Finalize / Execute / Source）
-- 不涉及：Join order 优化、代价模型等优化器策略
+本文覆盖物理选择、Sink/Combine/Finalize、probe执行与Source产出。Join order/costing本身不展开，但物理选择依赖其产生的左右分支、基数、条件和设置，不能单由SQL写法断言唯一算子。
 
----
+基类见 [physical_join.cpp](../src/execution/operator/join/physical_join.cpp) 的 `PhysicalJoin::BuildJoinPipelines`：常规连接先为RHS建立以join为sink的build子管线，再沿LHS构建probe管线；需要build侧补行或external处理时增加source子管线。
 
-## 2. Join 执行框架
+“左=LHS/probe、右=RHS/build”指优化后的物理计划。优化器可交换SQL中两张表，并反转LEFT/RIGHT、SEMI/RIGHT_SEMI等类型，不能将SQL文本顺序当作冻结的build选择。
 
-### 2.1 类层次
+IEJoin和常规AsOf使用双侧物化、最终Source产出的独立结构，不符合“只Sink右侧、左侧流式输出全部匹配”的通用模板。
 
-- `PhysicalJoin`：Join 基类，统一 `JoinType`、pipeline 构建、空 RHS 语义
-- `PhysicalComparisonJoin`：比较谓词 Join 基类，管理 `JoinCondition`
-- `PhysicalRangeJoin`：范围 Join 基类，封装排序与物化能力
+## 二、物理计划如何选择
 
-### 2.2 常见执行阶段
+入口：[plan_comparison_join.cpp](../src/execution/physical_plan/plan_comparison_join.cpp) 的 `PlanComparisonJoin`。
 
-多数 Join 算子按以下阶段执行：
+1. 特定直接递归CTE state scan、INNER等值/NOT DISTINCT key条件先尝试 `PhysicalRecursiveCTEKeyJoin`；只看普通分派会漏掉此分支。
+2. 无条件使用 `PhysicalCrossProduct`。
+3. 检查等值与范围条件：`can_merge = has_range > 0`，`can_iejoin = has_range >= 2`且无递归CTE限制；SEMI/ANTI/MARK的merge要求条件总数为1，RIGHT_SEMI/RIGHT_ANTI另禁用IEJoin。
+4. 有等值条件且未启用适用的 `prefer_range_joins` 时优先 `PhysicalHashJoin`；hash可以同时保留其他比较与残留布尔条件，并非“ON有复杂函数就必定blockwise”。
+5. 无优先hash路径时，任一侧估计基数低于 `nested_loop_join_threshold` 会关闭range候选；若merge与IE均可用，任一侧低于 `merge_join_threshold` 会关闭IE。
+6. 然后顺序尝试IEJoin、PiecewiseMerge、`PhysicalNestedLoopJoin::IsSupported`，最终把条件合成布尔表达式交给BlockwiseNL。
 
-1. **Sink**：先消费构建侧（通常 RHS），构建哈希表/排序结构/物化块
-2. **Finalize**：完成结构初始化和收尾（如指针表、排序结果）
-3. **ExecuteInternal**：消费探测侧（通常 LHS）并输出匹配结果
-4. **GetDataInternal**：输出右侧未匹配行（RIGHT/FULL）或外部阶段任务结果
+当前默认nested阈值5、merge阈值1000，来自 [settings.hpp](../src/include/duckdb/main/settings.hpp)，代码使用严格 `<` 判断。设置值不代替当前查询的实际估计，也不是本轮测试结果。
 
----
+`PhysicalNestedLoopJoin::IsSupported` 对comparison数、nested物理类型和SEMI/ANTI等有额外限制；不能将其当作支持所有join语义的最终兜底。MARK的生成还有构造期条件和专门三值逻辑约束。
 
-## 3. 物理 Join 选择（执行计划生成）
+## 三、Hash Join 的阶段与语义
 
-`src/execution/physical_plan/plan_comparison_join.cpp` 核心分派：
+依据：[physical_hash_join.cpp](../src/execution/operator/join/physical_hash_join.cpp)、[join_hashtable.cpp](../src/execution/join_hashtable.cpp)。
 
-- 无条件：`PhysicalCrossProduct`
-- 有等值条件：优先 `PhysicalHashJoin`
-- 范围条件：`PhysicalIEJoin` 或 `PhysicalPiecewiseMergeJoin`
-- 不满足上述：`PhysicalNestedLoopJoin`
-- 最后兜底：`PhysicalBlockwiseNLJoin`
+### Sink / Combine / Finalize
 
-补充：
+Sink计算RHS key与payload，写本地hash数据并积累需要的min/max/候选过滤；Combine汇总本地集合。Finalize根据临时内存reservation与分区大小决定内存内或external路径，不能只用一个静态“表大小阈值”解释spill。
 
-- `LogicalAsOfJoin` -> `PhysicalAsOfJoin`（部分小表场景可走 AsOfLoop/NL 路径）
-- `LogicalPositionalJoin` -> `PhysicalPositionalJoin`/`PhysicalPositionalScan`
-- `LogicalDelimJoin` -> `PhysicalLeftDelimJoin`/`PhysicalRightDelimJoin`（包裹普通 comparison join）
+内存内路径合并、Unpartition，尝试perfect hash，或安排pointer-table初始化及finalize事件。实际结构完成和deferred runtime filter发布可能在事件任务结束，`Finalize`返回READY并不表示所有工作都在这个函数调用内同步完成。
 
----
+External路径可repartition，处理当前可驻留分区，probe未匹配当前分区的输入可spill，source阶段按轮次处理剩余任务。runtime Bloom若要推到整个probe scan，必须覆盖完整build；详见 [RUNTIME_FILTER_DESIGN.md](./RUNTIME_FILTER_DESIGN.md)。
 
-## 4. 各 Join 算子执行要点
+### Probe / Source
 
-## 4.1 `PhysicalHashJoin`
+`ExecuteInternal` 计算LHS key并探测 `ScanStructure`。一批输入可产生多个输出chunk，状态必须保持到这批probe穷尽；SEMI/ANTI/MARK/SINGLE等使用专门路径。
 
-文件：
+RIGHT/FULL以及RIGHT_SEMI/RIGHT_ANTI要记录build侧是否匹配。source不是一概“输出右侧未匹配”：RIGHT_SEMI输出**已匹配**的build行且不按probe匹配次数重复；RIGHT_ANTI输出未匹配build行。external模式的source还负责分区轮次任务，不局限于outer补行。
 
-- `src/execution/operator/join/physical_hash_join.cpp`
-- `src/execution/join_hashtable.cpp`
+### Perfect hash 与本版本快速路径
 
-执行要点：
+[PerfectHashJoinExecutor::CanDoPerfectHashJoin](../src/execution/operator/join/perfect_hash_join_executor.cpp) 需要INNER、单整数等值、无残留predicate、可接受build类型及范围等条件。范围来自统计或build min/max；后续字典窄化等路径仍会重新拒绝不兼容情况，不能仅看到整数key就断言perfect hash。
 
-1. **Sink**：计算 RHS join key，写入线程本地哈希表，支持并行
-2. **Combine/Finalize**：合并本地表到全局表；内存不足时进入 external hash join（分区+spill）
-3. **ExecuteInternal**：对 LHS 计算 key，探测 `JoinHashTable::ScanStructure`
-4. **Source**：RIGHT/FULL 输出未匹配 build side；external 模式走分阶段任务流
+本版本还存在压缩向量probe、字典payload/结果发射及unique-left等快路径。其局部加速不改变连接保留侧、重复和NULL语义，也不能替代逐项条件门槛。本篇核对主入口，未穷尽这些专项快速路径。
 
-特性：
+## 四、各类普通连接
 
-- 可尝试 `PerfectHashJoinExecutor`（单整型等值且范围可控）
-- 支持 Join filter pushdown 统计与下推
-
-## 4.2 `PhysicalNestedLoopJoin`
-
-文件：`src/execution/operator/join/physical_nested_loop_join.cpp`
-
-执行要点：
-
-1. Sink：物化 RHS payload 和 RHS 条件列
-2. Execute：
-   - `SEMI/ANTI/MARK` 走简化路径（`NestedLoopJoinMark`）
-   - `INNER/LEFT/RIGHT/FULL` 走块级双层匹配，可叠加额外 predicate
-3. Source：RIGHT/FULL 扫描并输出 RHS 未匹配行
-
-## 4.3 `PhysicalBlockwiseNLJoin`
-
-文件：`src/execution/operator/join/physical_blockwise_nl_join.cpp`
-
-执行要点：
-
-- 先物化 RHS
-- 运行时通过 `CrossProductExecutor` 生成块级笛卡尔结果，再对任意布尔 `condition` 过滤
-- 作为不规则条件的兜底 Join
-
-## 4.4 `PhysicalPiecewiseMergeJoin`
-
-文件：`src/execution/operator/join/physical_piecewise_merge_join.cpp`
-
-执行要点：
-
-1. Sink RHS 并排序物化
-2. Execute 时对每个 LHS chunk 做局部排序（piecewise）
-3. 用主范围条件做块迭代匹配，额外条件走 tail filter
-4. RIGHT/FULL 在 Source 阶段补未匹配 RHS
-
-## 4.5 `PhysicalIEJoin`
-
-文件：`src/execution/operator/join/physical_iejoin.cpp`
-
-执行要点：
-
-- 典型双不等式范围连接算法
-- 双侧排序后在 Source 阶段通过任务机推进（`INIT` 到 `DONE`）
-- 内连接结果与 outer 补行均在 Source 阶段产出
-
-## 4.6 `PhysicalAsOfJoin`
-
-文件：`src/execution/operator/join/physical_asof_join.cpp`
-
-执行要点：
-
-- 先按分区键+时间顺序组织两侧数据（`SortStrategy`）
-- Source 阶段按分组执行 as-of 匹配（方向由比较符决定）
-- RIGHT/FULL 可补未匹配右侧
-
-## 4.7 `PhysicalPositionalJoin`
-
-文件：`src/execution/operator/join/physical_positional_join.cpp`
-
-执行要点：
-
-- 按行号对齐输出（语义上接近按 position 的 FULL OUTER）
-- LHS 有而 RHS 无 -> RHS 列补 NULL
-- RHS 还有剩余 -> Source 继续输出，LHS 列补 NULL
-
-## 4.8 `PhysicalLeftDelimJoin` / `PhysicalRightDelimJoin`
-
-文件：
-
-- `src/execution/operator/join/physical_left_delim_join.cpp`
-- `src/execution/operator/join/physical_right_delim_join.cpp`
-- `src/execution/physical_plan/plan_delim_join.cpp`
-
-执行要点：
-
-- 主要用于相关子查询去重（duplicate-eliminated side）
-- 结构上是：原始 join + distinct 聚合 + delim scan 依赖管理
-- 通过 `delim_join_dependencies` 约束 pipeline 执行依赖
-
-## 4.9 `PhysicalCrossProduct`
-
-文件：`src/execution/operator/join/physical_cross_product.cpp`
-
-执行要点：
-
-- 无 join condition 时采用
-- Sink 物化 RHS
-- Execute 逐值扫描一侧、整块引用另一侧持续输出笛卡尔积
-
----
-
-## 5. `JoinType` 在执行中的落地
-
-相关文件：
-
-- `src/common/enums/join_type.cpp`
-- `src/execution/operator/join/physical_join.cpp`
-- `src/execution/operator/join/physical_comparison_join.cpp`
-
-语义要点：
-
-- `SEMI/ANTI`：最多输出左侧行数，依赖 `found_match`
-- `MARK`：输出布尔标记，受 probe key 与 build-side NULL 语义影响
-- `LEFT/OUTER/SINGLE`：无匹配时右侧补 NULL
-- `RIGHT/OUTER/RIGHT_SEMI/RIGHT_ANTI`：需要传播 build side，通常在 Source 阶段补行
-
----
-
-## 6. 快速对照表：按 SQL 形态 -> 物理 Join 算子
-
-> 说明：实际选择还会受阈值、条件形态、数据统计和设置项影响，下表是主路径。
-
-| SQL 形态 | 常见条件示例 | 主要物理算子 |
+| 算子与源码 | 构建/执行模式 | 主要边界 |
 |---|---|---|
-| 等值连接 | `a.k = b.k`，多列等值 | `PhysicalHashJoin` |
-| 非等值范围连接（单/多不等式） | `a.t < b.t`、`a.x >= b.x` | `PhysicalPiecewiseMergeJoin` 或 `PhysicalIEJoin` |
-| 双不等式范围连接（IEJoin 典型） | `a.x < b.x AND a.y > b.y` | `PhysicalIEJoin` |
-| 复杂条件连接（含无法结构化为标准 join key 的表达式） | `ON f(a,b,c)` | `PhysicalBlockwiseNLJoin`（兜底） |
-| 一般比较连接兜底 | 条件不适配 hash/range | `PhysicalNestedLoopJoin` |
-| 无连接条件 | `FROM a, b` / `CROSS JOIN` | `PhysicalCrossProduct` |
-| ASOF 连接 | `ASOF JOIN ... ON a.sym=b.sym AND a.ts>=b.ts` | `PhysicalAsOfJoin`（部分场景可走 AsOfLoop/NL 路径） |
-| 相关子查询去重连接 | `EXISTS/IN/ANY` 等相关子查询变换后 | `PhysicalLeftDelimJoin` / `PhysicalRightDelimJoin`（内部通常包裹 Hash/NL/Range Join） |
-| 按位置连接 | `POSITIONAL JOIN` | `PhysicalPositionalJoin` / `PhysicalPositionalScan` |
+| [PhysicalNestedLoopJoin](../src/execution/operator/join/physical_nested_loop_join.cpp) | RHS条件列/payload物化；LHS逐批比较；需要时Source输出build侧结果 | SEMI/ANTI/MARK有专门路径；支持判定检查类型与条件；额外predicate对候选对求值 |
+| [PhysicalBlockwiseNLJoin](../src/execution/operator/join/physical_blockwise_nl_join.cpp) | RHS物化，CrossProductExecutor产生候选对，ExpressionExecutor执行任意布尔条件 | 构造明确排除MARK/SINGLE；SEMI/ANTI和右半/右反连接有状态，不能当成所有类型万能兜底 |
+| [PhysicalPiecewiseMergeJoin](../src/execution/operator/join/physical_piecewise_merge_join.cpp) | RHS排序，LHS每chunk排序后按主要范围匹配，其他条件继续检查 | 普通匹配在Execute；需要build侧结果时Source扫描；物理选择对join类型和条件数有限制 |
+| [PhysicalCrossProduct](../src/execution/operator/join/physical_cross_product.cpp) | RHS物化，LHS与RHS逐块组合，保留跨调用位置 | 无join condition；不是对所有复杂谓词直接产生最终笛卡尔结果 |
 
----
+上述有filter_pushdown info的NestedLoop/PiecewiseMerge也会Sink/Combine/Finalize min/max，因此runtime filtering不等于hash join专属。
 
-## 7. 关键源码入口索引
+## 五、IEJoin：双侧物化后Source执行
 
-- 计划分派：`src/execution/physical_plan/plan_comparison_join.cpp`
-- ASOF 分派：`src/execution/physical_plan/plan_asof_join.cpp`
-- Delim 分派：`src/execution/physical_plan/plan_delim_join.cpp`
-- Positional 分派：`src/execution/physical_plan/plan_positional_join.cpp`
-- Join 基类：`src/execution/operator/join/physical_join.cpp`
-- 哈希表核心：`src/execution/join_hashtable.cpp`
+[PhysicalIEJoin::BuildPipelines](../src/execution/operator/join/physical_iejoin.cpp) 把自身设为当前pipeline source，先建立RHS、再LHS sink管线并安排finish依赖。两侧数据完成后，Source通过排序后的范围连接任务产出结果与需要的outer/半连接语义。
+
+它典型用于至少两个不等式，仍受基数、join类型、recursive CTE和设置影响。`ExecuteInternal`的存在不能据此画成一般hash式流式probe；实际数据产出看 `GetDataInternal` 和任务状态机。
+
+## 六、ASOF 的分派与匹配边界
+
+入口：[plan_asof_join.cpp](../src/execution/physical_plan/plan_asof_join.cpp) 的 `PlanAsOfJoin`、`ValidateAsOfConditions`、`PlanAsOfLoopJoin`。
+
+常规ASOF在等值分区内，按一个方向不等式为每个probe选择最近候选；不是返回所有满足范围条件的连接对。`>=`/`>`与`<=`/`<`决定搜索方向和边界。
+
+- 小的是**LHS/probe估计基数**：已知估计且低于 `asof_loop_join_threshold`（默认64）可尝试loop方案；不是“小RHS一定走NL”。
+- loop方案反转连接，用row_number区分重复probe，配合first及arg_min/arg_max聚合再恢复输出。
+- 有任意非comparison predicate时强制尝试可一起评估的loop路径；不支持时抛NotImplemented，不能静默交给只检查comparison的常规ASOF。
+- 某些SEMI/ANTI/MARK加任意predicate的情形回普通 `PlanComparisonJoin`。
+- `debug_asof_iejoin` 提供window+IEJoin变体，不是默认路径。
+
+[physical_asof_join.cpp](../src/execution/operator/join/physical_asof_join.cpp) 的常规 `BuildPipelines` 与IEJoin一样先Sink两侧、最后Source执行；支持特定分区策略和outer补行。能看到RIGHT/OUTER处理分支，不代表planner对任意ASOF条件和join类型组合都接受。
+
+## 七、Positional 与 Delim
+
+[plan_positional_join.cpp](../src/execution/physical_plan/plan_positional_join.cpp)：两边均为TABLE_SCAN/POSITIONAL_SCAN时使用 `PhysicalPositionalScan`，否则 `PhysicalPositionalJoin`。按各侧输出位置对齐，较短一侧补NULL；这不是用持久rowid做等值连接，也不保证无显式排序的任意输入具有稳定SQL顺序。
+
+[plan_delim_join.cpp](../src/execution/physical_plan/plan_delim_join.cpp)：先规划内部comparison join，收集delim scans，建立去重聚合和依赖；没有delim scans时直接返回内部普通join。`PhysicalLeftDelimJoin` / `PhysicalRightDelimJoin` 是相关子查询计划的依赖/去重包装，不能与一个独立hash算法混为一谈。
+
+## 八、JoinType、空侧与NULL
+
+依据：[join_type.cpp](../src/common/enums/join_type.cpp)、[physical_join.cpp](../src/execution/operator/join/physical_join.cpp)、[join_hashtable.cpp](../src/execution/join_hashtable.cpp)。
+
+| 类型 | 必须保留的行为 |
+|---|---|
+| INNER | 输出精确匹配对，重复key会产生相应匹配组合 |
+| LEFT / FULL(`OUTER`) | 无匹配probe行补NULL；FULL还需输出未匹配build行 |
+| RIGHT | 已匹配对加未匹配build行；build侧传播不能省略 |
+| SEMI / ANTI | 左侧每行最多输出一次，分别按存在/不存在匹配选择；ANTI不能直接当作NOT IN |
+| RIGHT_SEMI / RIGHT_ANTI | Source按build的found_match状态输出，不按probe重复数复制 |
+| MARK | 左行加TRUE/FALSE/NULL标记，取决于比较、probe/build NULL、空build及相关分组；不是简单has_null布尔公式 |
+| SINGLE | scalar-subquery风格，一侧至多一个结果；无匹配补NULL，多匹配按设置报错，不能只描述成LEFT |
+
+`EmptyResultIfRHSIsEmpty` 对INNER、RIGHT、SEMI、RIGHT_SEMI、RIGHT_ANTI可提前无输出；LEFT/FULL/ANTI/MARK/SINGLE等必须按各自语义保留probe行为。普通等值和NOT DISTINCT的NULL处理不同，过滤/rehash/残留predicate都必须保持对应语义。
+
+## 九、阅读与验证边界
+
+从具体计划追踪时，应按 planner选择 → 对应算子BuildPipelines → Sink/Finalize事件 → Execute或Source → JoinType特例读取。本文仅静态核对这些主路径；未运行SQL、测试spilling/多线程/Unicode或性能，未证明任意SQL必然选择表中某一算子。

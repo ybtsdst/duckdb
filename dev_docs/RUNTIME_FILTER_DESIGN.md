@@ -1,600 +1,150 @@
 # DuckDB Table Function 与 Runtime Filter 设计文档
 
-## 1. 背景与核心概念
+> 适用源码：`v2.0-cyanoptera` @ `c1cd2470a455`；核对日期：2026-10-23。核对方式：静态源码审查，未执行本文示例或性能测试。
 
-### 1.1 什么是 Runtime Filter（运行时过滤器）
+## 一、背景与当前表示
 
-Runtime Filter（也称 Dynamic Filter）是一种执行时优化技术：在 Join 的 **Build 阶段**（构建哈希表）完成之后，将 Build 侧的数据特征（min/max 范围、IN 列表、Bloom Filter）"推送"回 Probe 侧的扫描算子，从而在扫描时提前跳过不可能满足 join 条件的数据分块（row group/block/partition），减少 I/O 和计算量。
+Join runtime filter 用 build 侧实际 key 信息减少 probe 扫描的候选。它只是候选裁剪，精确 join 仍负责重复行、残留条件、outer/NULL 等语义。实现不限于 hash join：Nested Loop、Piecewise Merge 和 IEJoin 也调用 `JoinFilterPushdownInfo` 生成 min/max；有 hash table 的路径才能进一步扫描 build keys、构建 Bloom/PRF 等结构。
 
-典型场景：
+当前运行期过滤也统一为 `ExpressionFilter`，不是活动 `ConstantFilter` / `InFilter` / `BFTableFilter` 类树。关键对象见 [join_filter_pushdown.hpp](../src/include/duckdb/execution/operator/join/join_filter_pushdown.hpp)、[table_filter_set.hpp](../src/include/duckdb/planner/table_filter_set.hpp)、[table_filter_functions.hpp](../src/include/duckdb/planner/filter/table_filter_functions.hpp)。
 
-```sql
-SELECT * FROM large_table l JOIN small_table s ON l.key = s.key WHERE s.category = 'A';
-```
-
-small_table 的 key 经过过滤后范围较窄（如 100~200），这个范围可在 Build 阶段计算出来，并在扫描 large_table 时直接跳过 key 不在此范围内的数据分块。
-
-### 1.2 与静态 Filter Pushdown 的区别
-
-| 特性 | 静态 Filter Pushdown | Runtime Filter |
-|---|---|---|
-| 决定时机 | 规划期（Optimizer） | 执行期（Build Pipeline 完成后） |
-| 来源 | WHERE 子句常量条件 | Join Build 侧的实际数据统计 |
-| 传递方式 | `LogicalGet::table_filters` | `LogicalGet::dynamic_filters` |
-| 过滤器类型 | `ConstantFilter`、`InFilter` 等 | `ConstantFilter`、`InFilter`、`BFTableFilter` 等 |
-
----
-
-## 2. 整体架构与数据流
-
-```
-Optimizer Phase (JoinFilterPushdownOptimizer)
-│
-├─ 遍历 LogicalComparisonJoin
-│   ├─ 对 probe 侧寻找支持 filter_pushdown 的 LogicalGet
-│   ├─ 创建 shared_ptr<DynamicTableFilterSet>，写入 LogicalGet::dynamic_filters
-│   └─ 创建 JoinFilterPushdownInfo（含 min/max aggregates），写入 join::filter_pushdown
-│
-Physical Plan Generation
-│
-├─ LogicalComparisonJoin → PhysicalHashJoin（携带 filter_pushdown）
-└─ LogicalGet → PhysicalTableScan（携带 dynamic_filters）
-         ↕ shared_ptr（共享所有权）
-    DynamicTableFilterSet
-         ↕ shared_ptr（共享所有权）
-    PhysicalHashJoin::filter_pushdown::probe_info
-
-Execution Phase
-│
-├─ [Pipeline 1] Hash Join Build 阶段
-│   ├─ Sink：收集 build 侧每列的 local min/max
-│   ├─ Combine：汇总为 global min/max
-│   └─ Finalize：
-│       ├─ 计算全局 min/max
-│       ├─ 生成 ConstantFilter / InFilter / BFTableFilter
-│       └─ 调用 DynamicTableFilterSet::PushFilter() 写入过滤器
-│
-└─ [Pipeline 2] Table Scan (Probe) 阶段（在 Build Pipeline 完成后调度）
-    └─ GetGlobalSourceState：
-        ├─ 检测 dynamic_filters->HasFilters()
-        ├─ 调用 GetFinalTableFilters() 合并静态+动态过滤器
-        └─ 将合并后的 TableFilterSet 传入 init_global / init_local
-```
-
----
-
-## 3. 关键数据结构
-
-### 3.1 `DynamicTableFilterSet`（核心共享桥梁）
-
-```cpp
-// src/include/duckdb/planner/table_filter.hpp
-class DynamicTableFilterSet {
-    mutable mutex lock;
-    reference_map_t<const PhysicalOperator, unique_ptr<TableFilterSet>> filters;
-public:
-    void ClearFilters(const PhysicalOperator &op);
-    void PushFilter(const PhysicalOperator &op, idx_t column_index, unique_ptr<TableFilter> filter);
-    bool HasFilters() const;
-    unique_ptr<TableFilterSet> GetFinalTableFilters(
-        const PhysicalTableScan &scan,
-        optional_ptr<TableFilterSet> existing_filters) const;
-};
-```
-
-- `LogicalGet` 和 `PhysicalTableScan` 都持有同一个 `shared_ptr<DynamicTableFilterSet>`
-- `PhysicalHashJoin` 的 `filter_pushdown->probe_info` 也引用同一个 `shared_ptr`
-- 这是 Build 侧**写入**、Scan 侧**读取**的共享内存通道，通过 mutex 保证线程安全
-
-### 3.2 `JoinFilterPushdownInfo`（存在于 Join 算子）
-
-```cpp
-// src/include/duckdb/execution/operator/join/join_filter_pushdown.hpp
-struct JoinFilterPushdownInfo {
-    vector<idx_t> join_condition;                   // 哪些 join 条件参与 min/max 聚合
-    vector<JoinFilterPushdownFilter> probe_info;    // 目标扫描的 DynamicTableFilterSet
-    vector<unique_ptr<Expression>> min_max_aggregates; // MIN/MAX 聚合表达式
-    bool build_side_has_filter;
-
-    void Sink(DataChunk &chunk, JoinFilterLocalState &) const;
-    void Combine(JoinFilterGlobalState &, JoinFilterLocalState &) const;
-    unique_ptr<DataChunk> Finalize(ClientContext &, optional_ptr<JoinHashTable> ht,
-                                   JoinFilterGlobalState &, const PhysicalComparisonJoin &) const;
-};
-```
-
-### 3.3 `TableFilterSet`（传入 Table Function 的过滤器集合）
-
-```cpp
-class TableFilterSet {
-public:
-    map<idx_t, unique_ptr<TableFilter>> filters; // column_index → filter
-};
-```
-
-`column_index` 是 `TableFunctionInitInput::column_ids` 中的位置索引，与 `return_types` 中的列编号对应。
-
-### 3.4 过滤器类型体系
-
-| 类型 | 枚举值 | 典型来源 | 含义 |
-|---|---|---|---|
-| `ConstantFilter` | 0 | 静态/动态 | `col OP C`，如 `key >= 100` |
-| `IsNullFilter` | 1 | 静态 | `col IS NULL` |
-| `IsNotNullFilter` | 2 | 静态 | `col IS NOT NULL` |
-| `ConjunctionOrFilter` | 3 | 静态 | OR 组合 |
-| `ConjunctionAndFilter` | 4 | 静态 | AND 组合 |
-| `StructExtractFilter` | 5 | 静态 | 结构体子列过滤 |
-| `OptionalFilter` | 6 | 动态 | 可选过滤，只用于 zonemap 剪枝，不保证正确性 |
-| `InFilter` | 7 | 动态 | `col IN (v1, v2, ...)`（build 侧数据量较小时） |
-| `DynamicFilter` | 8 | 动态 | 运行时可更新的占位过滤器，值由执行期算子原地更新；详见 §10 |
-| `ExpressionFilter` | 9 | 静态 | 任意表达式 |
-| `BFTableFilter` | 10 | 动态 | 概率 Bloom Filter（build 侧数据量较大时） |
-
-**Runtime Filter 产生的过滤器类型**（由 `JoinFilterPushdownInfo::FinalizeFilters` 生成）：
-
-- `min == max` 时：直接生成 `ConstantFilter`（等值）
-- `min != max` + equality join + 数据量小：`InFilter`（IN 列表）
-- `min != max` + equality join + 数据量大：`SelectivityOptionalFilter<BFTableFilter>` + 可选范围 `ConstantFilter`
-- `min != max` + range join：`SelectivityOptionalFilter<ConstantFilter>`（单侧范围）
-
----
-
-## 4. 执行时序
-
-```
-Build Pipeline (Pipeline 1)                Probe Pipeline (Pipeline 2)
-──────────────────────────────             ──────────────────────────────
-HashJoin::Sink()                            （等待 Pipeline 1 完成后调度）
-  → filter_pushdown->Sink()
-    → 收集 local min/max
-
-HashJoin::Combine()
-  → filter_pushdown->Combine()
-    → 合并为 global min/max
-
-HashJoin::Finalize()
-  → filter_pushdown->FinalizeMinMax()
-  → filter_pushdown->FinalizeFilters()
-    → DynamicTableFilterSet::PushFilter()
-      写入 ConstantFilter/InFilter/BFTableFilter
-                                             ↓ Pipeline 1 完成，调度 Pipeline 2
-                                             PhysicalTableScan::GetGlobalSourceState()
-                                               → dynamic_filters->HasFilters() == true
-                                               → GetFinalTableFilters(op, static_filters)
-                                                 合并静态+动态过滤器
-                                               → init_global(context, TableFunctionInitInput{
-                                                    ..., filters: merged_filters, ...})
-                                                 ← Table Function 在此消费过滤器
-
-                                             PhysicalTableScan::GetLocalSourceState()
-                                               → init_local(context, TableFunctionInitInput{
-                                                    ..., filters: merged_filters, ...})
-
-                                             PhysicalTableScan::GetData()
-                                               → function(context, data, chunk)
-```
-
-关键代码位于 `src/execution/operator/scan/physical_table_scan.cpp`：
-
-```cpp
-// PhysicalTableScan::GetGlobalSourceState
-TableScanGlobalSourceState(ClientContext &context, const PhysicalTableScan &op) {
-    if (op.dynamic_filters && op.dynamic_filters->HasFilters()) {
-        // 合并静态过滤器（来自 WHERE）和动态过滤器（来自 Join Build）
-        table_filters = op.dynamic_filters->GetFinalTableFilters(op, op.table_filters.get());
-    }
-    if (op.function.init_global) {
-        auto filters = table_filters ? *table_filters : GetTableFilters(op);
-        TableFunctionInitInput input(op.bind_data.get(), op.column_ids, op.projection_ids,
-                                     filters, op.extra_info.sample_options, &op);
-        global_state = op.function.init_global(context, input);
-    }
-}
-```
-
----
-
-## 5. 如何扩展 Table Function 支持 Runtime Filter
-
-### 5.1 必要条件：声明 `filter_pushdown = true`
-
-```cpp
-TableFunction my_table_function("my_scan", ...);
-
-// 必须设置为 true，否则：
-// 1. JoinFilterPushdownOptimizer 不会将此函数纳入 runtime filter 目标
-// 2. init_global/init_local 接收到的 filters 始终为 nullptr
-my_table_function.filter_pushdown = true;
-
-// 可选：允许裁剪只用于过滤但不出现在 SELECT 中的列
-my_table_function.filter_prune = true;
-```
-
-**原因**：`JoinFilterPushdownOptimizer::GetPushdownFilterTargets()` 在遍历发现 `LogicalGet` 时，检查 `get.function.filter_pushdown`，只有为 `true` 才将该扫描加入 runtime filter 链路（见 `src/optimizer/join_filter_pushdown_optimizer.cpp`）：
-
-```cpp
-case LogicalOperatorType::LOGICAL_GET: {
-    auto &get = probe_child.Cast<LogicalGet>();
-    if (!get.function.filter_pushdown) {
-        // filter pushdown 不支持，直接返回
-        return;
-    }
-    // ... 加入 targets
-}
-```
-
-### 5.2 在 `init_global` 中消费过滤器
-
-```cpp
-unique_ptr<GlobalTableFunctionState> MyInitGlobal(
-    ClientContext &context,
-    TableFunctionInitInput &input) {
-
-    auto state = make_uniq<MyGlobalState>();
-
-    // input.filters 已由 PhysicalTableScan::GetGlobalSourceState 合并：
-    //   静态过滤器（WHERE 子句下推）+ 动态过滤器（Join Runtime Filter）
-    if (input.filters) {
-        for (auto &[col_idx, filter] : input.filters->filters) {
-            // col_idx 是 column_ids 中的位置索引
-            // 利用过滤器跳过不满足条件的数据块（zonemap pruning）
-            state->ApplyZonemapFilter(col_idx, *filter);
-        }
-    }
-    return std::move(state);
-}
-```
-
-### 5.3 利用 `CheckStatistics` 做 Block 级剪枝
-
-`TableFilter::CheckStatistics()` 是与 Runtime Filter 对接的核心接口。对每个数据块维护统计信息（min/max），调用此方法决定是否跳过：
-
-```cpp
-void MyGlobalState::ApplyZonemapFilter(idx_t col_idx, TableFilter &filter) {
-    for (idx_t block_idx = 0; block_idx < total_blocks; block_idx++) {
-        BaseStatistics &block_stats = GetBlockStatistics(block_idx, col_idx);
-        auto result = filter.CheckStatistics(block_stats);
-        if (result == FilterPropagateResult::FILTER_ALWAYS_FALSE) {
-            // 该 block 中没有任何数据可能满足过滤条件，跳过
-            skip_blocks.insert(block_idx);
-        }
-    }
-}
-```
-
-`FilterPropagateResult` 的取值：
-
-| 值 | 含义 |
+| 对象 | 用途 |
 |---|---|
-| `NO_PRUNING_POSSIBLE` | 无法判断，不能跳过 |
-| `FILTER_ALWAYS_TRUE` | 整个 block 都满足，无需逐行过滤 |
-| `FILTER_ALWAYS_FALSE` | 整个 block 都不满足，直接跳过 |
+| `JoinFilterPushdownInfo` | 条件下标、min/max aggregates、probe 目标和构建/发布方法 |
+| `JoinFilterPushdownColumn` | probe binding、storage type、cast 重构步骤与模式 |
+| `DynamicTableFilterSet` | 多个物理生产者向同一目标 scan 发布的过滤集合，mutex 保护 |
+| `ExpressionFilter` | 实际比较/IN/可选/Bloom/PRF 表达式及绑定状态 |
+| `DynamicFilterData` | TopN 等原地更新边界值的另一机制，见本文第八节 |
 
-### 5.4 处理各种 Filter 类型
+## 二、优化器：哪些 join 与列可参与
 
-对于 Runtime Filter，`init_global` 阶段主要处理以下类型：
+依据：[join_filter_pushdown_optimizer.cpp](../src/optimizer/join_filter_pushdown_optimizer.cpp) 的 `GenerateJoinFilters`、`JoinFilterPushdownUtil::JoinTypeIsSupported`。
 
-```cpp
-void MyGlobalState::ApplyFilter(idx_t col_idx, TableFilter &filter) {
-    switch (filter.filter_type) {
-    case TableFilterType::CONSTANT_COMPARISON: {
-        auto &cf = filter.Cast<ConstantFilter>();
-        // cf.comparison_type: COMPARE_EQUAL/GREATER/LESSTHAN 等
-        // cf.constant: 比较的常量值（来自 build 侧 min 或 max）
-        ApplyRangeFilter(col_idx, cf.comparison_type, cf.constant);
-        break;
-    }
-    case TableFilterType::IN_FILTER: {
-        auto &inf = filter.Cast<InFilter>();
-        // 来自 build 侧数据量小时，inf.values 包含 build 侧所有值
-        ApplyInFilter(col_idx, inf.values);
-        break;
-    }
-    case TableFilterType::OPTIONAL_FILTER:
-    case TableFilterType::BLOOM_FILTER: {
-        // OPTIONAL_FILTER / BFTableFilter 是非强制的，不影响正确性
-        // 可选地利用其 CheckStatistics() 做 zonemap 剪枝
-        // 不应依赖 Bloom Filter 来决定输出哪些行（存在假阳性）
-        break;
-    }
-    case TableFilterType::CONJUNCTION_AND: {
-        auto &and_filter = filter.Cast<ConjunctionAndFilter>();
-        for (auto &child : and_filter.child_filters) {
-            ApplyFilter(col_idx, *child);
-        }
-        break;
-    }
-    default:
-        break; // 其他类型交由上层 Filter 算子处理
-    }
-}
+该 pass 在 [optimizer.cpp](../src/optimizer/optimizer.cpp) 的 `JOIN_FILTER_PUSHDOWN` 阶段遍历普通 `LOGICAL_COMPARISON_JOIN`，不是对所有 join 节点无条件运行。先 `PhysicalComparisonJoin::ReorderConditions` 冻结条件位置，再为可推条件建立 min/max aggregates。
+
+- 排除 MARK、SINGLE、LEFT、OUTER、ANTI、RIGHT_ANTI；常见可参与者为 INNER、SEMI、RIGHT、RIGHT_SEMI。这些排除保护必须保留的 probe 行。
+- 条件选择支持 `=`、`<`、`<=`、`>`、`>=`；当前生成入口跳过 `IS NOT DISTINCT FROM`，即使底层 Bloom 支持判断中预留了此比较，也不代表普通优化路径会生成它。
+- 目标 `LogicalGet` 必须声明 `filter_pushdown`。这只是能力条件，还必须找到适用 binding、类型和可穿透计划路径。
+- probe 表达式支持列引用、特定整数 cast 链（宽度至64位）、整数与 VARIANT cast 及 `variant_normalize`；一般函数不支持。普通 nested 类型和 INTERVAL 被拒绝，VARIANT 有专门模式约束。
+- min/max 若经 collation 绑定产生非单参数聚合，生成流程放弃该优化。
+
+### 到达扫描的路径
+
+`GetPushdownFilterTargets` 可穿透部分 FILTER、ORDER、DISTINCT、投影、分组键以及集合操作；aggregate 必须指向 group，不是任意聚合结果。UNNEST 不能把过滤应用到新展开的 unnest index。集合操作重写 binding，EXCEPT 只递归左侧。
+
+LIMIT / TOP_N 是明确停止点：在 join 前先截取的 probe 行集合不能被下推过滤重新选择。投影穿透使用 `PushdownJoinFilterExpression`，保留 cast 顺序和类型信息，不能仅把最终 key 常量强转到原列类型便宣称等价。
+
+即使没有 probe scan 目标，单条件整数 INNER 等值 join 仍可能保留 min/max aggregates，供 perfect hash 决策使用。因此“有 filter_pushdown info”不等于一定向 scan 发布了过滤器。
+
+## 三、cast 域与错误语义
+
+`JoinFilterPushdownMode::RECONSTRUCT_EXPRESSION` 允许在原始扫描值上重构 join key；`STORAGE_ONLY` 仅允许安全的 storage-domain 裁剪，不可直接对原值按另一个 key 域做 Bloom/PRF lookup。
+
+[RuntimeFilterCastUtil](../src/optimizer/runtime_filter_cast.cpp) 记录每一步默认 cast / TRY_CAST、计算输入类型并构造表达式。[physical_hash_join.cpp](../src/execution/operator/join/physical_hash_join.cpp) 的 `CreateRuntimeFilterInputExpression`、`CreateJoinFilterComparisonExpression`、`PreserveRuntimeFilterCastErrors` 在必要时保留会导致原 join cast 报错的输入，避免预过滤静默吞掉异常。
+
+本版本比较是 bound scalar function，使用 `BoundComparisonExpression::Create`，不能实例化旧 BoundComparisonExpression 类或直接写旧 `condition.left/right/comparison` 字段。
+
+## 四、Build、Finalize 与发布时序
+
+主要实现都在 [physical_hash_join.cpp](../src/execution/operator/join/physical_hash_join.cpp)，没有独立的 `join_filter_pushdown.cpp` 实现文件。
+
+```text
+GetGlobalState：ClearFilters(op)，清除同一生产者旧执行的集合
+Sink：本地 min/max；必要时积累覆盖完整 build 的 Bloom
+Combine：合并本地聚合与 hash 数据
+FinalizeMinMax：取得全局范围
+FinalizeFilters：发布简单表达式，或登记 deferred Bloom/PRF
+HashJoinFinalizeEvent::FinishTasks：完成结构、seal、发布 deferred filters
+依赖 build 完成的 probe pipeline 启动
+PhysicalTableScan global init：合并静态 + 各生产者运行期集合
+init_global / init_local：扫描器消费最终过滤器
 ```
 
-### 5.5 可选：实现 `statistics` 辅助全局剪枝
+`PhysicalJoin::BuildJoinPipelines` 建立 RHS build 到 LHS probe 的依赖；IEJoin 等双侧物化路径有自己的 pipeline 结构，见 [JOIN_EXECUTION_DESIGN.md](./JOIN_EXECUTION_DESIGN.md)。不能把所有 join 的调度都画成相同流式 probe 模式。
 
-```cpp
-unique_ptr<BaseStatistics> MyStatistics(
-    ClientContext &context,
-    const FunctionData *bind_data,
-    column_t column_index) {
+### 内存内 hash join
 
-    auto &my_bind = bind_data->Cast<MyBindData>();
-    // 返回整张表（全部分块）的列统计信息
-    return my_bind.GetGlobalColumnStatistics(column_index);
-}
+合并本地 hash table 后，先决定 perfect hash 和竞争的 filter 形态。Bloom/PRF 可以在 finalize materialize 完整 build 时构建，并在 finalize tasks 全部结束后发布。`PublishDeferredRuntimeFilters` 不会将尚未 sealed 或无效的 Bloom 交给扫描。
 
-my_table_function.statistics = MyStatistics;
-```
+### External hash join
 
-### 5.6 可选：实现 `pushdown_complex_filter` 处理分区过滤
+`ShouldBuildBloomFilterInSink` 根据估计大小、等值 key 数、build/probe 比例以及 `JoinIsLikelyExternal` 决定是否在 Sink 覆盖完整 build。`FinalizeExternalRuntimeFilters` 在全部 build 已合并后调用，并禁止用只覆盖当前轮 materialized 分区的结构构建全局 PRF。
 
-对于 Hive 分区或自定义分区结构，可通过此回调在规划期处理任意表达式：
+仅覆盖一个 spill 分区的 Bloom 不能安全下推到整张 probe 扫描。当前外部路径可发布完整 sink-built Bloom 与全局 min/max；若估计与实际外部化路径导致没有可发布完整结构，保守不发 Bloom，而不是拿部分集合替代。
 
-```cpp
-void MyPushdownComplexFilter(
-    ClientContext &context,
-    LogicalGet &get,
-    FunctionData *bind_data,
-    vector<unique_ptr<Expression>> &filters) {
+## 五、FinalizeFilters 的分支与收益条件
 
-    auto &my_bind = bind_data->Cast<MyBindData>();
-    for (auto it = filters.begin(); it != filters.end(); ) {
-        if (TryApplyAsPartitionFilter(my_bind, **it)) {
-            it = filters.erase(it); // 标记为已处理，不再生成 Filter 算子
-        } else {
-            ++it;
-        }
-    }
-}
-
-my_table_function.pushdown_complex_filter = MyPushdownComplexFilter;
-```
-
----
-
-## 6. 完整示例骨架
-
-```cpp
-// ──────────────────────────────────────────────────
-// 1. FunctionData（bind 阶段产出，执行期只读）
-// ──────────────────────────────────────────────────
-struct MyBindData : public FunctionData {
-    string data_path;
-    idx_t total_blocks;
-    // per-block statistics: block_idx -> col_idx -> BaseStatistics
-    vector<vector<unique_ptr<BaseStatistics>>> block_stats;
-
-    unique_ptr<FunctionData> Copy() const override { /* ... */ }
-    bool Equals(const FunctionData &other) const override { /* ... */ }
-};
-
-// ──────────────────────────────────────────────────
-// 2. GlobalTableFunctionState（init_global 产出，多线程共享）
-// ──────────────────────────────────────────────────
-struct MyGlobalState : public GlobalTableFunctionState {
-    vector<idx_t> blocks_to_scan; // 经 zonemap 过滤后需要扫描的 block 列表
-    atomic<idx_t> next_block_idx = {0};
-
-    void InitBlockList(const MyBindData &bind, optional_ptr<TableFilterSet> filters) {
-        for (idx_t i = 0; i < bind.total_blocks; i++) {
-            bool skip = false;
-            if (filters) {
-                for (auto &[col_idx, filter] : filters->filters) {
-                    auto result = filter->CheckStatistics(*bind.block_stats[i][col_idx]);
-                    if (result == FilterPropagateResult::FILTER_ALWAYS_FALSE) {
-                        skip = true;
-                        break;
-                    }
-                }
-            }
-            if (!skip) {
-                blocks_to_scan.push_back(i);
-            }
-        }
-    }
-
-    idx_t MaxThreads() const override {
-        return blocks_to_scan.size();
-    }
-};
-
-// ──────────────────────────────────────────────────
-// 3. Bind
-// ──────────────────────────────────────────────────
-unique_ptr<FunctionData> MyBind(
-    ClientContext &context,
-    TableFunctionBindInput &input,
-    vector<LogicalType> &return_types,
-    vector<string> &names) {
-    auto result = make_uniq<MyBindData>();
-    result->data_path = input.inputs[0].GetValue<string>();
-    // 读取 metadata，填充 block_stats ...
-    return std::move(result);
-}
-
-// ──────────────────────────────────────────────────
-// 4. init_global：消费 filters，完成 block-level 剪枝
-// ──────────────────────────────────────────────────
-unique_ptr<GlobalTableFunctionState> MyInitGlobal(
-    ClientContext &context,
-    TableFunctionInitInput &input) {
-
-    auto &bind = input.bind_data->Cast<MyBindData>();
-    auto state = make_uniq<MyGlobalState>();
-
-    // input.filters 已由 PhysicalTableScan 合并静态+动态过滤器
-    state->InitBlockList(bind, input.filters);
-
-    return std::move(state);
-}
-
-// ──────────────────────────────────────────────────
-// 5. Scan 函数：仅扫描过滤后的 blocks
-// ──────────────────────────────────────────────────
-void MyScan(ClientContext &context, TableFunctionInput &data, DataChunk &output) {
-    auto &gstate = data.global_state->Cast<MyGlobalState>();
-    auto &bind = data.bind_data->Cast<MyBindData>();
-
-    auto local_idx = gstate.next_block_idx.fetch_add(1);
-    if (local_idx >= gstate.blocks_to_scan.size()) {
-        output.SetCardinality(0);
-        return;
-    }
-    auto block_idx = gstate.blocks_to_scan[local_idx];
-    // 读取 block_idx 对应的数据 ...
-}
-
-// ──────────────────────────────────────────────────
-// 6. 注册
-// ──────────────────────────────────────────────────
-TableFunction GetMyTableFunction() {
-    TableFunction func("my_scan", {LogicalType::VARCHAR}, MyScan, MyBind, MyInitGlobal);
-    func.filter_pushdown = true; // 必须设置，否则 runtime filter 不会下推
-    func.filter_prune = true;
-    return func;
-}
-```
-
----
-
-## 7. 优化器触发条件
-
-`JoinFilterPushdownOptimizer::GenerateJoinFilters()` 的启用条件（`src/optimizer/join_filter_pushdown_optimizer.cpp`）：
-
-| 条件 | 要求 |
+| 情况 | 当前行为 |
 |---|---|
-| Join 类型 | `INNER`、`SEMI`、`RIGHT`、`RIGHT_SEMI`（LEFT/OUTER/ANTI 不支持） |
-| Join 条件 | 包含 `=`、`<`、`<=`、`>`、`>=` 可比较条件 |
-| Probe 侧扫描 | `LogicalGet::function.filter_pushdown == true` |
-| 列类型 | 非嵌套类型（STRUCT/LIST/MAP 不支持），非 INTERVAL 类型 |
-| 投影 | 可以通过 Projection/Aggregate 的 column reference 或 integral cast 向下穿透 |
+| min/max 转 storage type 失败或为 NULL | 跳过该候选过滤，不能据此多删行 |
+| min == max | 对 probe 生成原比较符与单值的表达式，可精确执行该必要条件 |
+| min != max，非等值比较 | 生成保守单侧界，使用 selectivity optional |
+| min != max，等值 | 尝试 optional IN、prefix-range、范围和/或 Bloom；不是简单按大小二选一 |
 
----
+方向以 `probe OP build` 为准：等值需要 `[min,max]`；`>`/`>=` 可用 `probe >= min`，`<`/`<=` 可用 `probe <= max`。这些 inclusive 界可以是宽松必要条件，精确 `<`/`>` 仍由 join 检查，不能照旧注释把所有范围称为半开区间。
 
-## 8. 注意事项
+### IN
 
-| 注意点 | 说明 |
-|---|---|
-| **过滤器在 init 时一次性注入** | `init_global` 调用时过滤器已确定，之后不再变化；block 列表在此时构建 |
-| **OPTIONAL_FILTER 不影响正确性** | 只用于 zonemap 剪枝，不能用于决定哪些数据行输出；Bloom Filter 存在假阳性 |
-| **静态+动态过滤器已合并** | `PhysicalTableScan::GetGlobalSourceState` 中调用 `GetFinalTableFilters` 完成合并，`init_global` 收到的是合并结果 |
-| **Pipeline 顺序保证** | DuckDB 保证 Build Pipeline 完成后才调度 Probe Pipeline；写入和读取 `DynamicTableFilterSet` 之间无并发冲突 |
-| **多次执行（如递归 CTE）** | `ClearFilters` 在每次 Build 开始前清除旧过滤器，`init_global` 在每次 Probe Pipeline 启动时重新调用 |
-| **`filter_pushdown = false`** | 优化器直接跳过，不生成 `DynamicTableFilterSet`，过滤器链路完全旁路 |
+`CanUseInFilter` 要求存在 hash table、实际 Count >1 且不超过 `DynamicOrFilterThresholdSetting`、比较为 `=`。`PushInFilter` 扫描对应 build key，转换到正确输入域并去重；含 NULL 或严格连续整数值域时不用 IN，后续选择范围/其他结构。发布的 IN 是 optional，仅用于安全辅助剪枝，不代替 join。
 
----
+### Bloom
 
-## 9. 相关源码索引
+`CanUseBloomFilter` 检查恰好一个等值条件、可用 hash table 与 build/probe 成本。当前 build/probe 比例上限为1；若 build 侧没有过滤，比例超过0.1且 build_count >4194304 时拒绝。估计是启发式输入，不能据此保证收益；多列 join 的多列统计 filter 也不意味着支持复合 key Bloom 下推。
 
-| 文件 | 说明 |
-|---|---|
-| `src/include/duckdb/function/table_function.hpp` | `TableFunction` 定义，`filter_pushdown`/`filter_prune` 等字段 |
-| `src/include/duckdb/planner/table_filter.hpp` | `TableFilter`、`TableFilterSet`、`DynamicTableFilterSet` |
-| `src/include/duckdb/planner/filter/dynamic_filter.hpp` | `DynamicFilter`、`DynamicFilterData` |
-| `src/include/duckdb/planner/filter/bloom_filter.hpp` | `BFTableFilter`、`BloomFilter` |
-| `src/include/duckdb/execution/operator/join/join_filter_pushdown.hpp` | `JoinFilterPushdownInfo`、`JoinFilterPushdownFilter` |
-| `src/include/duckdb/optimizer/join_filter_pushdown_optimizer.hpp` | `JoinFilterPushdownOptimizer` |
-| `src/optimizer/join_filter_pushdown_optimizer.cpp` | 优化器实现，`GetPushdownFilterTargets`、`GenerateJoinFilters` |
-| `src/execution/operator/join/physical_hash_join.cpp` | `Sink`/`Combine`/`Finalize`，写入 `DynamicTableFilterSet` |
-| `src/execution/operator/scan/physical_table_scan.cpp` | `GetGlobalSourceState`，读取并合并过滤器，调用 `init_global` |
-| `src/planner/table_filter.cpp` | `DynamicTableFilterSet` 实现 |
-| `src/include/duckdb/planner/operator/logical_get.hpp` | `LogicalGet::dynamic_filters`、`table_filters` |
-| `src/planner/filter/dynamic_filter.cpp` | `DynamicFilter` / `DynamicFilterData` 实现 |
-| `src/optimizer/topn_optimizer.cpp` | `TopN::PushdownDynamicFilters`，Top-N 动态过滤器下推 |
-| `src/execution/operator/order/physical_top_n.cpp` | `TopNBoundaryValue::UpdateValue`，执行期更新边界值 |
+[BloomFilter::Initialize / Seal](../src/planner/filter/table_filter_bloom_function.cpp) 使用每64位一个 sector、每hash四个位，初始按估计行数和内存预算定尺寸；Seal 可 fold 并释放多余内存，再按 density 判断是否仍有用。发布持有 `shared_ptr<const BloomFilter>`，完整且 sealed 后不可再插入。不存在由固定12 bits/key直接保证的实测假阳性率。
 
----
+### Prefix-range filter（PRF）
 
-## 10. `DynamicFilter` 类型本身与 Top-N 下推
+`CanUsePrefixRangeFilter` 继承 Bloom 的成本条件，进一步要求等值、非 NULL 相等语义、支持的 key 类型和可计算 span。`FinalizeFilters` 优先考虑 span 小于 `1<<26` 的精确位预算，再比较 span 和 Bloom 位预算；合适时登记 PRF 并跳过后续范围/Bloom选择。小 IN 可能已经额外发布，所以不能将这些选择描述成严格互斥的单一 filter。
 
-前面 §2~§9 描述的是 **Join runtime filter** 路径：桥梁是 `DynamicTableFilterSet`，运行期被
-`PushFilter` 进去的是具体的 `ConstantFilter` / `InFilter` / `BFTableFilter`——**并不是
-`TableFilterType::DYNAMIC_FILTER`（枚举值 8）这个类型本身**。
+PRF build state 在 finalize lanes 中归并，预算约束和类型实现见 [prefix-range 实现](../src/planner/filter/table_filter_prefix_range_function.cpp)。本篇核对选择和发布边界，未逐个穷尽其所有物理类型内核。
 
-`DynamicFilter` 类型真正的构造点在 Top-N 优化器。本节单独说明这个类型的机制，以及它的主用例
-Top-N 下推。
+## 六、扫描消费与自适应可选执行
 
-### 10.1 `DynamicFilter` 与 `DynamicFilterData`（类型机制）
+[TableScanGlobalSourceState](../src/execution/operator/scan/physical_table_scan.cpp) 把最终集合保存到全局 source state，`init_local` 引用同一集合。单列 key 是 `ProjectionIndex`，先映射到 `input.column_indexes`，不能拿它直接索引数据源原 schema。多生产者同列过滤合并为 AND。
 
-`DynamicFilter`（`src/include/duckdb/planner/filter/dynamic_filter.hpp`）是一个 `TableFilter`
-子类，本身几乎不持有状态，只持有一个 `shared_ptr<DynamicFilterData>`——真正的比较值在执行期
-才被填进去。计划期下推的是这个稳定的占位句柄，执行期算子通过共享指针更新它。
+普通 optional 的行级实现恒 TRUE，child 用于统计；selectivity optional 可以真正缩小候选，命中率太高时暂停，之后重试。当前 min/max、BF、PRF 策略为6个vector观察，阈值分别0.9、0.5、0.5，见 [GetThresholdAndVectorsToCheck](../src/planner/filter/table_filter_functions.cpp) 和 [SelectivityStats::Update](../src/planner/filter/table_filter_selectivity_optional_function.cpp)。
 
-```cpp
-struct DynamicFilterData {
-    mutex lock;
-    unique_ptr<ConstantFilter> filter;   // 真正干活的常量过滤器
-    atomic<bool> initialized = {false};  // 值是否已填好
+Bloom 假阳性不禁止行级预过滤：确定不属于 build 的 key 可以排除，留下的候选仍交给精确 join。不能用 Bloom 阳性来认定连接已匹配，也不能忽略 NULL 和 cast 错误保留策略。
 
-    void SetValue(Value val);            // 原地更新 filter->constant，置 initialized=true
-    void Reset();                        // 置 initialized=false
-};
+## 七、自定义 Table Function 的责任
 
-class DynamicFilter : public TableFilter {
-    shared_ptr<DynamicFilterData> filter_data;  // 与生产者算子共享同一份
-};
+声明 `filter_pushdown` 后扫描会成为潜在目标，但 callback、列映射和类型能力仍需要实现。以下是经过接口核对的伪代码，不是完整扩展：
+
+```text
+init(input):
+  for entry in *input.filters:
+    projection_pos = entry.GetIndex()
+    source_column = input.column_indexes[projection_pos]
+    用该列的块统计检查 entry.Filter() 内的 ExpressionFilter
+  保留所有“无法证明不可能匹配”的块
+scan():
+  生成候选行
+  对完全接受的静态精确谓词执行行级判断
+  运行期 hint 可在支持时继续预过滤
 ```
 
-生命周期：
+`PhysicalTableScan` 不提供任意 table function 的自动行级补过滤。若只实现块剪枝而忽略完全下推静态谓词，结果可能错误。不能把 unsupported type 的精确过滤静默丢弃；普通 planner 有类型回退路径，扩展需要诚实声明能力。
 
-- `SetValue(val)`：加锁，把 `val` 写入内层 `ConstantFilter::constant`，置 `initialized=true`。
-  对 `NULL` 值直接忽略（不更新）。
-- `Reset()`：置回 `initialized=false`（多次执行场景下复位）。
+真实接口节选：[DynamicTableFilterSet](../src/include/duckdb/planner/table_filter_set.hpp)：
 
-关键方法（`src/planner/filter/dynamic_filter.cpp`）：
+```cpp
+void PushFilter(const PhysicalOperator &op, ProjectionIndex column_index,
+                unique_ptr<TableFilter> filter);
+unique_ptr<TableFilterSet> GetFinalTableFilters(
+    const PhysicalTableScan &scan, optional_ptr<TableFilterSet> existing_filters) const;
+```
 
-| 方法 | 未初始化时 | 已初始化时 |
-|---|---|---|
-| `CheckStatistics` | 返回 `NO_PRUNING_POSSIBLE`（等于不裁剪、全扫） | 转发给内层 `ConstantFilter::CheckStatistics` |
-| `ToExpression` | 返回常量 `true`（过滤器空转） | 内层 `ConstantFilter` 的表达式 |
-| `Equals` | 按 `filter_data` 指针比较 | 同左 |
-| `Copy` | 共享同一个 `filter_data`（浅拷贝句柄，不复制值） | 同左 |
+## 八、TopN 的 DynamicFilterData 是另一种动态路径
 
-线程安全由 `DynamicFilterData::lock`（更新/读取内层过滤器）+ `atomic<bool> initialized`
-（无锁快速判定）共同保证：生产者算子写值、多个扫描线程读值，互不冲突。
+TopN 在规划期就下推 `ExpressionFilter(optional(dynamic(...)))`，运行中原地收紧共享边界，无需每次向 `DynamicTableFilterSet` 新增集合。
 
-### 10.2 与 `ConstantFilter` / `DynamicTableFilterSet` 的区别
+[DynamicFilterData](../src/include/duckdb/planner/filter/table_filter_functions.hpp) 当前保存比较类型和 Value，使用 shared mutex 与初始化标志；`SetValue` / `Reset` 实现在 [dynamic_filter.cpp](../src/planner/filter/dynamic_filter.cpp)，执行和统计 callback 在 [table_filter_dynamic_function.cpp](../src/planner/filter/table_filter_dynamic_function.cpp)。
 
-三者容易混淆，对比如下：
+[TopN::PushdownDynamicFilters](../src/optimizer/topn_optimizer.cpp) 接受首排序键 numeric physical type 或 VARCHAR 的列引用，还检查可达目标和可安全重构的 cast 链；不接受 TRY_CAST/无法保留排序及错误语义的路径。ASC 单键 `< boundary`、多键 `<= boundary`，DESC 对称；NULLS FIRST 保留 NULL。 [TopNBoundaryValue::UpdateValue](../src/execution/operator/order/physical_top_n.cpp) 把执行中改善的边界解码并更新。
 
-| 概念 | 是什么 | 值的确定时机 | 谁来写值 |
-|---|---|---|---|
-| `ConstantFilter` | 单个过滤器，`col OP C` | 规划期定死 | 优化器 |
-| `DynamicTableFilterSet` | 过滤器**集合容器**（§3.1），Join 路径的共享桥梁 | 执行期 | Hash Join Build `Finalize` 调 `PushFilter`，推入的是具体 `ConstantFilter`/`InFilter`/`BFTableFilter` |
-| `DynamicFilter`（枚举 8） | **单个**占位过滤器，自身在规划期就下推固定 | 执行期 | 执行期算子调 `DynamicFilterData::SetValue`，原地更新内层 `ConstantFilter` 的值 |
+未初始化时动态谓词保守不裁剪；初始化后后续统计检查可使用新边界。不能把“集合初始化时合并一次”误解为“所有 filter 值从此永不变化”。
 
-要点：Join 下推的产物**不是** `DynamicFilter` 类型；`DynamicFilter` 是一个「过滤器结构固定、只有
-内部常量值会变」的轻量占位符，主用例是 Top-N。
+## 九、验证边界
 
-### 10.3 Top-N 下推（主用例）
-
-对 `ORDER BY col LIMIT N` 这类查询，Top-N 算子在执行中能算出「当前第 N 名的边界值」，把它通过
-`DynamicFilter` 喂给下层表扫描，让扫描端提前裁掉 stats 上不可能进入前 N 的 row group。
-
-**优化器侧** —— `TopN::PushdownDynamicFilters`（`src/optimizer/topn_optimizer.cpp:67`）：
-
-- 触发条件：`ORDER BY` 首列是整型或 `VARCHAR`，且为单列的 `BOUND_COLUMN_REF`（不支持表达式）。
-- 比较方向：
-  - 升序（取最小 N 个）→ `C <= boundary`；只有单个 `ORDER BY` 列时可收紧为 `C < boundary`。
-  - 降序（取最大 N 个）→ `C >= boundary`；单列时收紧为 `C > boundary`。
-- 建一个 `DynamicFilterData` + 占位 `ConstantFilter`（初值用 `Value::MinimumValue` / 空串 `""`），
-  写入 `LogicalTopN::dynamic_filter`。
-- 对每个下推目标 `LogicalGet`，包一个 `DynamicFilter(filter_data)`；若 `NULLS FIRST`，再套一层
-  `ConjunctionOrFilter(IsNullFilter, DynamicFilter)`；最外层统一套 `OptionalFilter`，
-  最后 `get.table_filters.PushFilter(...)` 推进表扫描。
-
-**执行期侧** —— `physical_top_n.cpp` 的 `TopNBoundaryValue::UpdateValue`：
-
-- Top-N 算子维护一个大小为 N 的堆；处理输入时不断算出当前第 N 名的边界值。
-- 边界**单调收紧**时（新边界比旧的更优），调用 `op.dynamic_filter->SetValue(...)` 更新动态过滤器。
-- 扫描端随后对每个 row group 调 `DynamicFilter::CheckStatistics`，边界越紧、裁剪越激进。
-
-**正确性边界**：下推的 `DynamicFilter` 最外层是 `OptionalFilter` → 它**只用于 zonemap 剪枝、不保证
-正确性**（参见 §8 中 `OPTIONAL_FILTER` 的说明）。Top-N 的精确语义仍由算子自身的堆保证；动态过滤器
-纯粹是「锦上添花」的 I/O 优化，即使完全不生效（如一直未 `initialized`）结果也正确。
-
-### 10.4 一句话总结
-
-`TableFilterType::DYNAMIC_FILTER` = 一个**值由执行期算子（主要是 Top-N）动态填入、跨线程共享、
-惰性初始化**的占位 `TableFilter`：规划期下推固定的句柄，执行期原地更新内层 `ConstantFilter` 的值，
-未填值时等价于「不裁剪」，从而在不影响正确性的前提下随执行推进逐步收紧 row group 剪枝。
+本文核对优化器生成条件、cast路径、内外部 hash生命周期、deferred发布和扫描消费，亦定位三种非hash join调用方。未运行 SQL、外部化、多线程/递归CTE或性能测试；没有断言所有执行中必然发布某种 filter、必然触发某种 reader剪枝或得到固定加速。

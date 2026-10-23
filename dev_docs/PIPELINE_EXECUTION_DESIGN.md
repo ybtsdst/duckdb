@@ -1,593 +1,147 @@
 # DuckDB Pipeline 并行执行引擎设计文档
 
-## 概述
+> 适用源码：`v2.0-cyanoptera` @ `c1cd2470a455`；核对日期：2026-10-23。核对方式：静态源码审查，未执行本文示例或性能测试。
 
-本文档整理了 DuckDB `src/parallel` 目录下的核心代码，详细说明 Pipeline 并行执行引擎的架构设计，涵盖 Pipeline 构建、事件驱动调度、任务并行执行、中断机制等关键模块，为理解或扩展 DuckDB 执行引擎提供参考。
+## 概述与源码入口
 
----
+Pipeline 将物理计划划分为可逐块执行的数据流，事件图描述初始化、执行及收尾之间的依赖，任务调度器分配实际执行线程。本文所有流程图和代码骨架均是解释用的简化表示，未编译运行；它们不替代具体算子的状态机。
 
-## 一、源码文件总览
+| 概念 | 声明与实现，重点符号 |
+|---|---|
+| 查询协调 | [executor.hpp](../src/include/duckdb/execution/executor.hpp)、[executor.cpp](../src/parallel/executor.cpp)：`Executor::InitializeInternal`、`ScheduleEventsInternal`、`CancelTasks` |
+| Pipeline | [pipeline.hpp](../src/include/duckdb/parallel/pipeline.hpp)、[pipeline.cpp](../src/parallel/pipeline.cpp)：`Pipeline`、`PipelineTask`、`PipelineBuildState` |
+| 执行循环 | [pipeline_executor.hpp](../src/include/duckdb/parallel/pipeline_executor.hpp)、[pipeline_executor.cpp](../src/parallel/pipeline_executor.cpp)：`Execute`、`FlushAndFinalize`、`PushFinalize` |
+| 分组与依赖图 | [meta_pipeline.cpp](../src/parallel/meta_pipeline.cpp)：`MetaPipeline`；[pipeline_schedule.cpp](../src/parallel/pipeline_schedule.cpp)：`BuildPipelineSchedule` |
+| 事件 | [event.cpp](../src/parallel/event.cpp)：`Event::SetTasks`、`CompleteDependency`、`Finish` |
+| 线程池与队列 | [task_scheduler.cpp](../src/parallel/task_scheduler.cpp)、[task_scheduler_queue.cpp](../src/parallel/task_scheduler_queue.cpp)、[task_scheduler_pool.cpp](../src/parallel/task_scheduler_pool.cpp) |
+| 阻塞与错误 | [interrupt.hpp](../src/include/duckdb/parallel/interrupt.hpp)、[interrupt.cpp](../src/parallel/interrupt.cpp)、[executor_task.cpp](../src/parallel/executor_task.cpp) |
 
-### 实现文件（`src/parallel/`）
+## 一、执行单元与线程归属
 
-| 文件 | 核心类 | 职责说明 |
-|------|--------|----------|
-| `executor.cpp` | `Executor`, `ScheduleEventData` | 查询执行器入口，负责 Pipeline 构建与事件 DAG 调度 |
-| `pipeline.cpp` | `Pipeline`, `PipelineTask`, `PipelineBuildState` | Pipeline 定义、并行度决策、任务调度 |
-| `pipeline_executor.cpp` | `PipelineExecutor`, `ExecutionBudget` | 单个 Pipeline 实例的执行循环（核心执行引擎） |
-| `meta_pipeline.cpp` | `MetaPipeline` | 将共享同一 Sink 的多条 Pipeline 分组管理 |
-| `task_scheduler.cpp` | `TaskScheduler`, `ConcurrentQueue` | 线程池与任务队列管理 |
-| `event.cpp` | `Event` | 事件 DAG 节点基类，管理依赖与完成通知 |
-| `pipeline_event.cpp` | `PipelineEvent` | 触发 Pipeline 主体执行的事件 |
-| `pipeline_initialize_event.cpp` | `PipelineInitializeEvent`, `PipelineInitializeTask` | Pipeline 初始化（重置 Sink 全局状态） |
-| `pipeline_prepare_finish_event.cpp` | `PipelinePrepareFinishEvent`, `PipelinePreFinishTask` | 调用 `PrepareFinalize`（内存报告等） |
-| `pipeline_finish_event.cpp` | `PipelineFinishEvent`, `PipelineFinishTask` | 调用 `Finalize`（生成最终结果） |
-| `pipeline_complete_event.cpp` | `PipelineCompleteEvent` | 标记 Pipeline 执行完成，驱动后续 Pipeline |
-| `base_pipeline_event.cpp` | `BasePipelineEvent` | Pipeline 相关事件的公共基类 |
-| `executor_task.cpp` | `ExecutorTask` | 带 Executor 上下文的可执行任务基类 |
-| `task_executor.cpp` | `TaskExecutor`, `BaseExecutorTask` | 辅助并行任务执行的工具类 |
-| `interrupt.cpp` | `InterruptState`, `InterruptDoneSignalState` | 异步阻塞与回调机制 |
-| `thread_context.cpp` | `ThreadContext` | 线程级状态（profiler、logger 等） |
-| `task_notifier.cpp` | `TaskNotifier` | 任务状态变化的监听与通知 |
+典型有 Sink 的 Pipeline 在一次执行中按 `Source → Operators → Sink` 处理 DataChunk：调用 Source 拉取一块，再把该块推过中间算子直至 Sink。`PipelineTask` 懒构造并持有自己的 `PipelineExecutor`，其中保存 LocalSourceState、LocalSinkState、中间 OperatorState、缓冲块及恢复位置。
 
-### 头文件（`src/include/duckdb/parallel/`）
+这些本地状态属于执行实例，不能理解为固定 OS 线程的 TLS。任务因执行预算或 BLOCKED 暂停后可以由另一个线程继续执行，同一个 `PipelineExecutor` 和本地状态会保留。全局状态由多个执行实例共享；不同实例可并发调用算子，扩展中的共享可变数据需要同步。Global/Local 是配对状态类型，不存在 `GlobalSourceState` 继承出 `LocalSourceState` 的关系。
 
-与上述实现文件一一对应，另含 `task.hpp`（抽象任务基类）、`task_counter.hpp`（任务计数）、`concurrentqueue.hpp`（无锁队列第三方库封装）。
-
----
-
-## 二、总体架构
-
-DuckDB 采用 **推送式（Push-based）Pipeline 执行模型**，配合**事件驱动调度**实现查询的多线程并行执行。
-
-```
-物理查询计划 (PhysicalOperator 树)
-        │
-        ▼
-Executor::Initialize()
-        │  构建 MetaPipeline / Pipeline
-        ▼
-Executor::ScheduleEvents()
-        │  生成事件 DAG
-        ▼
-TaskScheduler（线程池）
-        │  任务出队执行
-        ▼
-PipelineExecutor（每线程一个）
-   [Source → Operators → Sink]
+```text
+Executor::InitializeInternal
+  ├─ MetaPipeline::Build → PhysicalOperator::BuildPipelines
+  ├─ PipelineBuildState::ResolveExternalInputs
+  ├─ MetaPipeline::Ready → Pipeline::Ready（恢复算子顺序）
+  └─ ScheduleEventsInternal
+       └─ BuildPipelineSchedule → Event 图 → TaskScheduler
+            └─ PipelineTask → PipelineExecutor
+                 └─ Source.GetData → Operators.Execute → Sink.Sink
 ```
 
-**核心设计理念：**
+2.0 还支持外部输入 Pipeline。`Pipeline::Schedule` 对 `IsExternalInput()` 走 `ScheduleExternalInputEvent`，不创建普通扫描任务；数据通过 `PipelineExecutor::PushExternal` 等入口推进，结束时由生产侧调用完成逻辑。不能把“每条 Pipeline 必然有 N 个扫描任务”作为全局不变量。相关入口见 [pipeline.cpp](../src/parallel/pipeline.cpp) 的 `SetExternalInput`、`CompleteExternalInput`、`PipelineBuildState::ResolveExternalInputs` 和 [pipeline_executor.cpp](../src/parallel/pipeline_executor.cpp) 的外部输入方法；本文不展开完整广播交换协议。
 
-1. **Pipeline-centric**：每条 Pipeline 表示一段可并行执行的数据流（`Source → 中间算子 → Sink`）
-2. **MetaPipeline 分组**：将共享同一 Sink 的多条 Pipeline 归为一组，统一管理批次索引与依赖关系
-3. **事件 DAG 协调**：使用五阶段事件链（Initialize → Execute → PrepareFinish → Finish → Complete）描述 Pipeline 的生命周期，并通过 DAG 表达 Pipeline 间的依赖
-4. **基于任务的并行**：每条 Pipeline 并行执行时拆分为 N 个 `PipelineTask`，每个任务持有独立的 `PipelineExecutor`
-5. **中断机制**：支持 Source/Sink 的异步阻塞，通过回调重新入队任务，实现非阻塞执行
+## 二、并行度与状态初始化
 
----
+普通扫描路径的 `Pipeline::Schedule` 先 `Reset()`，初始化/取得 Source、Sink 和中间算子的全局状态，再尝试 `ScheduleParallel()`。关键决策已经集中到 `Pipeline::TryGetMaxThreads`：
 
-## 三、Pipeline 核心结构
+1. Sink 必须 `ParallelSink()`，Source 必须 `ParallelSource()`，所有中间算子必须 `ParallelOperator()`。
+2. 从 Source 全局状态的 `MaxThreads()` 开始，应用存在的中间算子全局状态限制。
+3. 受 `TaskScheduler::NumberOfThreads()` 的 regular 线程数约束，再应用 Sink 全局状态限制，最后再次限制到 regular 线程数。
+4. Sink 需要 batch index 时，`ScheduleParallel` 还检查 Source 的 `SupportsPartitioning()`，不满足会抛出 `InternalException`。
+5. `LaunchScanTasks` 仅在上限大于 1 时创建多个任务，否则回退到单个 `PipelineTask`。
 
-### 3.1 Pipeline 定义
+因此任务数是执行上限，既不保证创建同等数量的新线程，也不保证所有任务同时运行。`NumberOfAsyncThreads()` 没有直接加入此处扫描并行度上限。
 
-`Pipeline`（`src/parallel/pipeline.hpp`）是执行的基本单元，代表一段从 Source 到 Sink 的数据流：
+`ResetSink()` 在算子的锁内按需创建全局 Sink 状态；`ResetSource(false)` 复用已存在的 Source 状态。设置 `INITIALIZE_ON_SCHEDULE` 的表扫描由调度图记录，`ScheduleEventsInternal` 在启动事件前调用 `ResetSource(true)` 提前初始化。重复执行另有 `ResetForReschedule` 与显式 `SupportsReuse`/`Reset` 钩子，不能把全局初始化次数固定为对象生命周期内恰好一次。
 
-```cpp
-class Pipeline {
-    optional_ptr<PhysicalOperator> source;           // 数据源（TableScan 等）
-    vector<reference<PhysicalOperator>> operators;   // 中间算子链（注意：构建时逆序，Ready() 后正序）
-    optional_ptr<PhysicalOperator> sink;             // 数据汇（Aggregate、HashJoin 等）
+## 三、MetaPipeline 与物理计划拆分
 
-    unique_ptr<GlobalSourceState> source_state;      // Source 的全局状态（跨线程共享）
+`MetaPipeline` 通常组织写入同一 Sink 的 Pipeline，并给它们分配批次索引范围。`CreateChildMetaPipeline` 默认向父 Pipeline 添加对子 MetaPipeline 完成的依赖；`CreateUnionPipeline` 复制算子链及依赖，保序时建立执行依赖；`CreateChildPipeline` 在同一组内创建后续执行路径，并设置组内依赖。这些操作的具体调用由物理算子的 `BuildPipelines` 决定。
 
-    // 批次索引追踪（用于有序 Sink）
-    idx_t base_batch_index;
-    multiset<idx_t> batch_indexes;                   // 当前活跃批次索引集合
-    mutex batch_lock;
+Hash Join 的 Build 和 Probe 不应画成“同一 MetaPipeline 内共享 HashJoin Sink 的两条 Pipeline”。在 [physical_join.cpp](../src/execution/operator/join/physical_join.cpp) 的 `PhysicalJoin::BuildJoinPipelines` 中，Build 侧建立以 Join 为 Sink 的子 MetaPipeline，Probe 侧把 Join 加为父 Pipeline 的中间算子，再继续构建左子树。示意：
 
-    // Pipeline 依赖关系（DAG）
-    vector<weak_ptr<Pipeline>> parents;              // 依赖本 Pipeline 的 Pipeline
-    vector<weak_ptr<Pipeline>> dependencies;         // 本 Pipeline 依赖的 Pipeline
-};
+```text
+子 MetaPipeline：TableScan(build) → HashJoin 的 Build Sink
+                                    │ 完成依赖（含 Finalize）
+父 Pipeline：   TableScan(probe) → HashJoin 的 Probe Operator → 下游 Sink
 ```
 
-**关键方法：**
+`UNION ALL` 等路径可以共享一个收尾链；一个物理算子也可能承担不同 Pipeline 中的 Source/Sink/Operator 角色。不要根据树上节点数推导任务或事件数量。
 
-| 方法 | 说明 |
-|------|------|
-| `Schedule(event)` | 决定并行/串行执行并创建对应任务 |
-| `ScheduleParallel(event)` | 检查所有算子是否支持并行，若支持则创建 N 个 `PipelineTask` |
-| `ScheduleSequentialTask(event)` | 创建单个串行 `PipelineTask` |
-| `LaunchScanTasks(event, n)` | 生成 N 个 `PipelineTask` 并交由事件调度 |
-| `RegisterNewBatchIndex()` | 为新线程注册批次索引 |
-| `UpdateBatchIndex(old, new)` | 更新批次索引（线程安全） |
-| `ResetSink()` | 初始化 Sink 的全局状态（加锁保护，幂等） |
-| `PrepareFinalize()` | 调用 Sink 的 `PrepareFinalize`（内存使用报告） |
-| `Ready()` | Pipeline 就绪，将算子链逆序还原为正序 |
+## 四、事件图与收尾链
 
-### 3.2 并行度决策
+[BuildPipelineSchedule](../src/parallel/pipeline_schedule.cpp) 先生成调度阶段，再由 `Executor::ScheduleEventsInternal` 创建实际 Event 并连边。基础链为：
 
-```cpp
-bool Pipeline::ScheduleParallel(shared_ptr<Event> &event) {
-    // 所有组件必须支持并行
-    if (!sink->ParallelSink()) return false;
-    if (!source->ParallelSource()) return false;
-    for (auto &op : operators)
-        if (!op.ParallelOperator()) return false;
-
-    // 确定最大并行度
-    auto max_threads = source_state->MaxThreads();              // Source 能提供的最大并行度
-    max_threads = min(max_threads, scheduler.NumberOfThreads()); // 不超过线程池大小
-    if (sink->sink_state)
-        max_threads = sink->sink_state->MaxThreads(max_threads); // Sink 的并行上限
-
-    return LaunchScanTasks(event, max_threads);
-}
+```text
+INITIALIZE → EXECUTE → PREPARE_FINISH → FINISH → COMPLETE
 ```
 
-### 3.3 批次索引（Batch Index）
+| 阶段与实现 | 职责 |
+|---|---|
+| [PipelineInitializeTask](../src/parallel/pipeline_initialize_event.cpp) | 普通路径 `ResetSink()`；外部输入路径 `PrepareExternalInput()` |
+| [PipelineEvent](../src/parallel/pipeline_event.cpp) | 调用 `Pipeline::Schedule`，正常路径启动扫描任务 |
+| [PipelinePreFinishTask](../src/parallel/pipeline_prepare_finish_event.cpp) | 调用 Sink 的 `PrepareFinalize`，算子可报告内存需求等 |
+| [PipelineFinishTask](../src/parallel/pipeline_finish_event.cpp) | 对要求全局收尾的中间算子调用 `OperatorFinalize`，然后调用 Sink `Finalize`；二者均可 BLOCKED |
+| [PipelineCompleteEvent](../src/parallel/pipeline_complete_event.cpp) | 向 Executor 报告 MetaPipeline 完成 |
 
-批次索引用于支持有序 Sink（如带 `ORDER BY` 的聚合），确保多线程处理结果可以按顺序合并：
+并非每条 Pipeline 都独占五个事件。`AddMetaPipeline` 为基础 Pipeline 建完整链，其他 Pipeline 可共享 initialize/prepare/finish/complete，或者拥有独立 prepare/finish、加入 finish group。`Executor::InitializeInternal` 的完成计数按 MetaPipeline 设置。
 
-- 每条 Pipeline 的 `base_batch_index = BATCH_INCREMENT × pipeline_count_in_metapipeline`
-- 每个线程通过 `RegisterNewBatchIndex()` 获取一个批次索引槽
-- 处理到下一批数据时调用 `UpdateBatchIndex()` 更新，Sink 通过最小批次索引判断哪些结果已就绪
+跨 Pipeline 普通完成依赖指向依赖方的 COMPLETE；数据流依赖仅要求生产方 INITIALIZE 完成；组内依赖连接 EXECUTE 阶段。同一父 Pipeline 下的兄弟 JOIN_BUILD，还建立“所有执行完成后才能 PrepareFinalize、所有 PrepareFinalize 完成后才能 Finalize”的内存协调屏障。详见 `BuildPipelineSchedule`。
 
----
+`Event::CompleteDependency` 在依赖计数满足后调度，`FinishTask` 在任务计数满足后完成事件，`Finish` 通知父事件。无任务时是否自动完成还受 `AutoFinishWithoutTasks()` 控制：外部输入的 `PipelineEvent` 特意返回 false，不能立即结束。`BuildPipelineSchedule` 的有环检查会抛出运行时异常；额外的 `VerifyScheduledEvents` DFS 属于调试校验。
 
-## 四、PipelineExecutor：执行引擎核心
+## 五、PipelineExecutor 的可恢复状态机
 
-`PipelineExecutor`（`src/parallel/pipeline_executor.cpp`）是单个线程执行 Pipeline 的核心类，每个 `PipelineTask` 持有一个实例。
+[PipelineExecutor::Execute](../src/parallel/pipeline_executor.cpp) 的简化逻辑如下，省略了 profiler 和若干分区细节：
 
-### 4.1 核心状态
-
-```cpp
-class PipelineExecutor {
-    Pipeline &pipeline;
-    ThreadContext thread;          // 线程级上下文（profiler 等）
-    ExecutionContext context;      // 执行上下文
-
-    // 中间数据块（每个算子一个缓冲）
-    vector<unique_ptr<DataChunk>> intermediate_chunks;
-    vector<unique_ptr<OperatorState>> intermediate_states;
-
-    // Source/Sink 的线程本地状态
-    unique_ptr<LocalSourceState> local_source_state;
-    unique_ptr<LocalSinkState> local_sink_state;
-
-    // 执行控制标志
-    bool exhausted_source;         // Source 已耗尽
-    bool started_flushing;         // 开始 Flush 阶段
-    bool done_flushing;            // Flush 阶段完成
-    bool remaining_sink_chunk;     // Sink 上次返回 BLOCKED，有待处理数据
-    bool next_batch_blocked;       // NextBatch 调用被阻塞
-
-    // 算子还有输出未处理的栈（HAVE_MORE_OUTPUT 场景）
-    stack<idx_t> in_process_operators;
-};
+```text
+先完成 pending_batch_advance_state（空批次推进/最小批次更新）
+  → 若 remaining_sink_chunk，重试尚未被 Sink 接收的块
+  → 若中间算子仍有 HAVE_MORE_OUTPUT，复用输入继续推送
+  → 若 Pipeline 已耗尽，FlushAndFinalize
+  → 否则 FetchFromSource，必要时 NextBatch，再推到 Sink
+预算耗尽且仍有工作：NOT_FINISHED
+需要外部唤醒：INTERRUPTED
+Flush 和 Combine 完成：FINISHED
 ```
 
-### 4.2 执行循环
-
-```
-Execute(max_chunks)
-│
-├─ 若 remaining_sink_chunk → 重试上次被阻塞的 Sink 写入
-├─ 若 in_process_operators 非空 → 继续推送算子的剩余输出
-├─ 若 source 未耗尽 → FetchFromSource() 获取新数据块
-│      └─ 若需要批次追踪 → NextBatch()
-│      └─ ExecutePushInternal()：逐算子推送直到 Sink
-├─ 若 source 耗尽且未完成 Flush → TryFlushCachingOperators()
-│      （触发有缓存算子的 FinalExecute）
-└─ 所有数据处理完毕 → PushFinalize()
-       （调用 Sink.Combine() 合并本地状态到全局状态）
-```
+应区分各接口的结果类型，定义见 [operator_result_type.hpp](../src/include/duckdb/common/enums/operator_result_type.hpp)：
 
-**数据流向：**
+| 调用边界 | 结果与恢复要点 |
+|---|---|
+| Source `GetData` | `HAVE_MORE_OUTPUT`、`FINISHED`、`BLOCKED`；在本版本显式 HAVE_MORE_OUTPUT 可以携带空块；FINISHED 携带的最终非空块仍会推送 |
+| 中间 `Execute` | `NEED_MORE_INPUT` 消费完本输入；`HAVE_MORE_OUTPUT` 入恢复栈；`FINISHED` 提前结束 Pipeline。枚举虽含 BLOCKED，头文件明确普通中间算子当前不应返回它，执行循环未提供通用中间算子阻塞恢复协议 |
+| Sink `Sink` | BLOCKED 保留最终块重试；FINISHED 可提前停止上游，不等于 Source 自然 EOF |
+| `NextBatch` / `UpdateMinBatchIndex` | 可以 BLOCKED；执行器保存批次推进阶段，恢复时不重新抓取当前块 |
+| `FinalExecute` | 按 HAVE_MORE_OUTPUT/FINISHED 多轮刷新缓存；推送这些输出时仍可预算耗尽或被 Sink 阻塞 |
+| Sink `Combine` | 合并本地状态到全局，可 BLOCKED；成功后才设置 `finalized` |
 
-```
-source_chunk
-    └→ intermediate_chunks[0]  (operator[0].Execute)
-         └→ intermediate_chunks[1]  (operator[1].Execute)
-              └→ ...
-                   └→ final_chunk → sink.Sink()
-```
-
-### 4.3 算子返回值语义
-
-| 返回值 | 含义 |
-|--------|------|
-| `NEED_MORE_INPUT` | 当前输入处理完，需要下一个数据块 |
-| `HAVE_MORE_OUTPUT` | 算子还有输出未产出，不需要新输入（入栈 `in_process_operators`） |
-| `BLOCKED` | 算子被阻塞（异步 I/O 等），任务暂停 |
-| `FINISHED` | 算子执行完毕，Pipeline 可以结束 |
-
-### 4.4 收尾阶段（PushFinalize）
-
-```cpp
-PipelineExecuteResult PipelineExecutor::PushFinalize() {
-    // 将线程本地 Sink 状态合并到全局状态
-    sink->Combine(context, {*sink->sink_state, *local_sink_state, interrupt_state});
-
-    // 释放中间算子状态
-    for (auto &state : intermediate_states)
-        state->Finalize(...);
-
-    executor.Flush(thread);  // 刷新 profiler 数据
-    return FINISHED;
-}
-```
-
----
+`TryFlushCachingOperators` 保留 `flushing_idx`、`should_flush_current_idx` 与恢复栈，防止重试时重复执行已经产出数据的 FinalExecute。`PushFinalize` 在 Combine 成功后通知 Source、结束局部 profiler、调用中间状态 Finalize 并刷新信息。它不是 Sink 全局 `Finalize`；后者属于事件链 FINISH 阶段。
 
-## 五、MetaPipeline：Pipeline 分组管理
-
-`MetaPipeline`（`src/parallel/meta_pipeline.cpp`）将共享同一 Sink 的多条 Pipeline 组织在一起，是构建 Pipeline DAG 的核心。
-
-### 5.1 结构定义
-
-```cpp
-class MetaPipeline {
-    optional_ptr<PhysicalOperator> sink;                     // 共享的 Sink 算子
-    MetaPipelineType type;                                    // REGULAR 或 JOIN_BUILD
-    bool recursive_cte;                                       // 是否属于递归 CTE
-
-    vector<shared_ptr<Pipeline>> pipelines;                  // 本 MetaPipeline 的所有 Pipeline
-    reference_map_t<Pipeline, vector<reference<Pipeline>>>   // Pipeline 内部依赖
-        pipeline_dependencies;
-
-    vector<shared_ptr<MetaPipeline>> children;               // 子 MetaPipeline（Join Build 侧等）
-    optional_ptr<Pipeline> parent;                           // 父 Pipeline
-};
-```
-
-### 5.2 为什么需要 MetaPipeline
-
-以 Hash Join 为例：
-
-```
-MetaPipeline (JOIN_BUILD)
-  Sink: HashJoin
-  ├── Pipeline[0] (Base): TableScan(b) → HashJoin (Build)
-  └── Pipeline[1]: TableScan(a) → HashJoin (Probe)
-```
-
-- 构建侧（BUILD）必须全部完成才能开始探测侧（PROBE）
-- 两侧共享同一 `HashJoin` Sink，需要在同一 MetaPipeline 中统一管理批次索引
-- `AssignNextBatchIndex()` 为每条 Pipeline 分配不同的批次起点
-
-### 5.3 Union Pipeline
-
-```cpp
-Pipeline &MetaPipeline::CreateUnionPipeline(Pipeline &current, bool order_matters) {
-    // 创建与 current 相同算子链的新 Pipeline（继承 current 的所有依赖）
-    // 若需要保序，则 union_pipeline 依赖 current
-}
-```
-
-用于 `UNION ALL` 等操作：多条数据流汇入同一 Sink，可并行（不保序）或串行（保序）。
-
-### 5.4 Child Pipeline
-
-```cpp
-void MetaPipeline::CreateChildPipeline(Pipeline &current, PhysicalOperator &op, Pipeline &last_pipeline) {
-    // 为需要先完成的子计算（如 Join 的 Build 侧）创建单独 Pipeline
-    // child_pipeline 必须在 current 完成后才能执行
-}
-```
-
----
-
-## 六、事件驱动调度系统
-
-### 6.1 事件类型
-
-每条 Pipeline（准确说是 MetaPipeline 中的每条 Pipeline）会生成一个五阶段事件链：
-
-```
-PipelineInitializeEvent
-    → PipelineEvent（主执行）
-        → PipelinePrepareFinishEvent
-            → PipelineFinishEvent
-                → PipelineCompleteEvent
-```
-
-| 事件类型 | 任务类型 | 职责 |
-|----------|----------|------|
-| `PipelineInitializeEvent` | `PipelineInitializeTask`（1 个） | 调用 `pipeline->ResetSink()` 初始化全局 Sink 状态 |
-| `PipelineEvent` | `PipelineTask`（N 个，并行） | 调用 `pipeline->Schedule()` 创建并行执行任务 |
-| `PipelinePrepareFinishEvent` | `PipelinePreFinishTask`（1 个） | 调用 `pipeline->PrepareFinalize()` 报告内存用量 |
-| `PipelineFinishEvent` | `PipelineFinishTask`（1 个） | 调用 `sink->Finalize()` 生成最终输出 |
-| `PipelineCompleteEvent` | 无任务（纯标记） | 驱动后续依赖 Pipeline 的事件调度 |
-
-### 6.2 事件 DAG 构建
-
-`Executor::SchedulePipeline()` 为每条 Pipeline 创建五阶段事件并建立依赖关系：
-
-```
-基础 Pipeline 事件链：
-Initialize → Event → PrepareFinish → Finish → Complete
-
-MetaPipeline 内其他 Pipeline（Union、Child 等）：
-• Union Pipeline：Event 在 base Initialize 之后，PrepareFinish 之前
-• Child Pipeline（如 IEJoin 特殊情况）：Event 在 base Finish 之后，有独立的 Finish 事件
-```
-
-**跨 MetaPipeline 依赖（`ScheduleEventsInternal`）：**
-
-```cpp
-// Pipeline A 依赖 Pipeline B：A 的 Event 等待 B 的 Complete
-entry.second.pipeline_event.AddDependency(dep_entry.pipeline_complete_event);
-
-// 同级 Join Build Pipeline 的内存协调：
-// 所有 Join Build 的 PrepareFinish 必须等待所有 Join Build 的 Event 完成
-// 所有 Join Build 的 Finish 必须等待所有 Join Build 的 PrepareFinish 完成
-child1.PrepareFinish.AddDependency(child2.Event);
-child1.Finish.AddDependency(child2.PrepareFinish);
-```
-
-### 6.3 事件节点（Event 基类）
-
-```cpp
-class Event {
-    atomic<idx_t> finished_tasks;       // 已完成任务数
-    atomic<idx_t> total_tasks;          // 总任务数
-    atomic<idx_t> finished_dependencies;// 已满足依赖数
-    idx_t total_dependencies;           // 总依赖数
-    vector<weak_ptr<Event>> parents;    // 本事件完成后需通知的父事件
-};
-
-// 依赖满足时调用
-void Event::CompleteDependency() {
-    if (++finished_dependencies == total_dependencies) {
-        Schedule();   // 所有依赖满足，调度本事件
-        if (total_tasks == 0) Finish();  // 无需任务，直接完成
-    }
-}
-
-// 一个任务完成时调用
-void Event::FinishTask() {
-    if (++finished_tasks == total_tasks) Finish();
-}
-
-// 事件本身完成时通知所有父事件
-void Event::Finish() {
-    FinishEvent();  // 子类自定义逻辑
-    finished = true;
-    for (auto &parent : parents)
-        parent->CompleteDependency();
-    FinalizeFinish();  // 子类自定义收尾（PipelineCompleteEvent 在此触发 CompletePipeline）
-}
-```
-
----
-
-## 七、TaskScheduler：线程池与任务队列
-
-### 7.1 结构
-
-```cpp
-class TaskScheduler {
-    unique_ptr<ConcurrentQueue> queue;            // 基于 moodycamel 的无锁并发队列
-    vector<unique_ptr<SchedulerThread>> threads;  // 后台工作线程
-    vector<unique_ptr<atomic<bool>>> markers;     // 各线程停止信号
-
-    atomic<int32_t> requested_thread_count;       // 期望线程数
-    atomic<int32_t> current_thread_count;         // 当前活跃线程数
-};
-```
-
-### 7.2 任务队列实现
-
-- **底层库**：[moodycamel ConcurrentQueue](https://github.com/cameron314/concurrentqueue)（无锁多生产者多消费者队列）
-- **生产者令牌（ProducerToken）**：每个 `Executor` 持有一个，隔离不同查询的任务队列
-- **消费者**：任意线程均可从任意生产者队列消费任务
-- **唤醒机制**：轻量级信号量（`LightweightSemaphore`），线程空闲时 `wait()`，有任务时 `signal(N)`
-- **批量入队**：`EnqueueBulk()` 减少入队开销
-
-### 7.3 线程工作循环
-
-```
-ExecuteForever(stop_marker):
-  while !stop_marker:
-    semaphore.wait()
-    if stop_marker: break
-    task = queue.Dequeue()
-    if task:
-      result = task->Execute(PROCESS_PARTIAL)
-      if result == TASK_NOT_FINISHED:
-        queue.Enqueue(task)   // 未完成，重新入队
-      elif result == TASK_BLOCKED:
-        // 任务已调用 Deschedule()，等待外部回调 Reschedule()
-      elif result == TASK_FINISHED:
-        event->FinishTask()   // 通知事件
-    else:
-      // 队列暂时为空，刷新内存分配器
-      allocator.Flush()
-```
-
-### 7.4 执行模式
-
-| 模式 | 说明 |
-|------|------|
-| `PROCESS_PARTIAL` | 处理最多 `PARTIAL_CHUNK_COUNT`（50）个数据块后返回，允许任务重新入队实现公平调度 |
-| `PROCESS_ALL` | 执行直到完成或阻塞 |
-
----
-
-## 八、中断（Interrupt）机制
-
-### 8.1 设计目的
-
-允许 Source/Sink 的异步操作（如网络 I/O、云存储读取）在不阻塞工作线程的情况下暂停任务，待操作完成后重新调度。
-
-### 8.2 InterruptState
-
-```cpp
-enum class InterruptMode {
-    NO_INTERRUPTS,  // 不支持中断（同步模式）
-    TASK,           // 任务模式：持有 Task 的弱引用，完成时调用 Reschedule()
-    BLOCKING        // 阻塞模式：持有条件变量，完成时 Signal()
-};
-
-class InterruptState {
-    InterruptMode mode;
-    weak_ptr<Task> current_task;                     // TASK 模式
-    weak_ptr<InterruptDoneSignalState> signal_state; // BLOCKING 模式
-
-    void Callback() const {
-        if (mode == TASK)     current_task->Reschedule();  // 重新入队任务
-        if (mode == BLOCKING) signal_state->Signal();      // 唤醒等待线程
-    }
-};
-```
-
-### 8.3 执行流程
-
-```
-1. Source/Sink 发起异步操作，返回 BLOCKED（携带 InterruptState）
-2. PipelineExecutor 返回 INTERRUPTED
-3. PipelineTask 返回 TASK_BLOCKED
-4. ExecutorTask::Deschedule() 将任务加入"待重调度"列表（不再入队）
-5. 异步操作完成 → 调用 interrupt_state.Callback()
-6. TASK 模式：task->Reschedule() → 重新入队 TaskScheduler
-7. 任务再次执行时，PipelineExecutor 从上次暂停处继续（remaining_sink_chunk / next_batch_blocked 标志）
-```
-
----
-
-## 九、数据流与执行全流程
-
-### 9.1 简单查询示例
-
-```sql
-SELECT SUM(amount) FROM sales WHERE region = 'US'
-```
-
-**Pipeline 结构：**
-```
-Source: TableScan(sales)
-  → Filter(region='US')
-  → Aggregate(SUM)  ← Sink
-```
-
-**执行步骤：**
-
-```
-1. Executor::Initialize(plan)
-   ├── MetaPipeline::Build() 遍历物理计划树，构建 Pipeline
-   └── MetaPipeline::Ready() 将算子链逆序
-
-2. Executor::ScheduleEvents()
-   └── 为 Pipeline 生成 5 个事件（Initialize/Event/PrepareFinish/Finish/Complete）
-
-3. PipelineInitializeEvent 触发
-   └── PipelineInitializeTask: pipeline->ResetSink() 创建 GlobalAggregateState
-
-4. PipelineEvent 触发
-   └── pipeline->ScheduleParallel() → 创建 N 个 PipelineTask（N = 可用线程数）
-
-5. 每个 PipelineTask（并行）：
-   loop:
-     chunk = source.GetData(local_source_state)  // TableScan 分配行范围
-     chunk = filter.Execute(chunk)
-     aggregate.Sink(chunk, local_sink_state)      // 累积本地聚合结果
-   end
-   aggregate.Combine(global_state, local_state)  // 合并到全局状态
-
-6. PipelinePrepareFinishEvent: aggregate.PrepareFinalize() 报告内存
-
-7. PipelineFinishEvent:
-   └── aggregate.Finalize() → 生成最终聚合结果，写入输出算子
-
-8. PipelineCompleteEvent: Executor::CompletePipeline()
-```
-
-### 9.2 Join 查询示例
-
-```sql
-SELECT * FROM a JOIN b ON a.id = b.id
-```
-
-**MetaPipeline 结构：**
-```
-MetaPipeline (JOIN_BUILD, Sink=HashJoin)
-  ├── Pipeline[0] Base:  TableScan(b) → HashJoin(Build)  ← 必须先完成
-  └── Pipeline[1]:       TableScan(a) → HashJoin(Probe)  ← 依赖 Pipeline[0]
-```
-
-**事件依赖关系：**
-```
-Build_Initialize → Build_Event → Build_PrepareFinish → Build_Finish
-                                                              ↓
-Probe_Initialize → Probe_Event → Probe_PrepareFinish → Probe_Finish → Complete
-```
-
----
-
-## 十、关键数据结构汇总
-
-### 状态层次结构
-
-```
-GlobalSourceState（Source 全局状态，跨线程共享，如文件列表分配）
-└── LocalSourceState（每线程独立，如当前读取位置）
-
-GlobalSinkState（Sink 全局状态，如全局哈希表、全局聚合结果）
-└── LocalSinkState（每线程独立，如本地聚合累加器）
-
-GlobalOperatorState（中间算子全局状态，可选）
-└── OperatorState（中间算子线程本地状态）
-```
-
-### 线程安全机制
-
-| 机制 | 用途 |
-|------|------|
-| `mutex` + `lock_guard` | Sink/Operator 全局状态初始化（`ResetSink`、`Reset`） |
-| `atomic<idx_t>` | Event 任务计数、依赖计数 |
-| `mutex batch_lock` | Pipeline 批次索引集合的并发访问 |
-| `mutex producer_lock` | ConcurrentQueue 每个生产者的入队保护 |
-| `LightweightSemaphore` | 工作线程的休眠与唤醒 |
-| `condition_variable` | BLOCKING 模式中断的等待与通知 |
-| `weak_ptr<Task>` | TASK 模式中断的任务引用（避免循环引用） |
-
----
-
-## 十一、Pipeline 构建流程
-
-`MetaPipeline::Build()` 通过递归调用 `PhysicalOperator::BuildPipelines()` 自顶向下遍历物理计划树：
-
-```
-PhysicalOperator::BuildPipelines(pipeline, meta_pipeline):
-  if IsSource():
-    pipeline.SetSource(this)
-  if IsSink():
-    // 创建子 MetaPipeline 处理所有输入
-    for each child:
-      child_meta = meta_pipeline.CreateChildMetaPipeline(pipeline, this)
-      child_meta.Build(child)
-  else:
-    pipeline.AddOperator(this)
-    for each child:
-      child.BuildPipelines(pipeline, meta_pipeline)
-```
-
-`PipelineBuildState` 辅助管理构建过程，提供设置 Source、Sink、Operator 的接口，并通过 `BATCH_INCREMENT` 为每条 Pipeline 分配不重叠的批次索引空间。
-
----
-
-## 十二、文件源码位置速查
-
-| 概念 | 关键源文件 |
-|------|-----------|
-| 执行入口 | `src/execution/executor.cpp`, `src/parallel/executor.cpp` |
-| Pipeline 构建 | `src/execution/physical_operator.cpp`, `src/parallel/meta_pipeline.cpp` |
-| Pipeline 调度 | `src/parallel/pipeline.cpp` |
-| Pipeline 执行循环 | `src/parallel/pipeline_executor.cpp` |
-| 事件系统 | `src/parallel/event.cpp`, `src/parallel/pipeline_*_event.cpp` |
-| 线程池 | `src/parallel/task_scheduler.cpp` |
-| 中断机制 | `src/parallel/interrupt.cpp` |
-| Source/Sink 接口 | `src/include/duckdb/execution/physical_operator.hpp` |
-| 状态接口 | `src/include/duckdb/execution/operator/` 各算子目录 |
+### 批次索引
+
+批次索引用于需要保序/分区信息的 Sink，不等同 SQL `ORDER BY` 的完整排序实现。`MetaPipeline::AssignNextBatchIndex` 分配不重叠的基础范围，`PipelineTask` 构造时可预留活跃索引，避免懒构造执行器让最小索引提前前进。`PipelineExecutor::ToPipelinePartitionData` 将 Source 索引映射为 `base + source_index + 1` 并检查范围，`NextBatch` 检查单调性并维护最小索引。
+
+2.0 的 `SourceBatchIndexState::ADVANCED` 支持“未产出行但批次前进”的通知，`FetchFromSource` 连同 SourceResultType 保存它，后续经过 NextBatch 和 UpdateMinBatchIndex 两步。相关限制有的仅为 `D_ASSERT`（如 ADVANCED 对应 BLOCKED），不能写成所有构建都强制检查的运行保证。
+
+## 六、TaskScheduler 的两个池与任务预算
+
+[TaskScheduler](../src/include/duckdb/parallel/task_scheduler.hpp) 使用按 [TaskSchedulerType](../src/include/duckdb/common/enums/task_scheduler_type.hpp) 索引的 pools/queues 数组：REGULAR 和 ASYNC。每个池有独立队列与线程管理，`ProducerToken` 为每个队列持有独立底层 producer token，查询仍可用一个外层 token 做任务归属和 drain。
+
+线程路由并非严格隔离：
+
+- `ExecuteForever(REGULAR)` 顺序检查所有队列，regular worker 可以执行 async 队列任务。
+- async worker 只消费自身队列。
+- `GetTaskFromProducer`、`ExecuteTasks` 等调用线程协作路径也会检查多个队列。
+- 未指定 pool 的 `ScheduleTask(s)` 默认 REGULAR；`AsyncResult` 自身默认也是 REGULAR，调用方可指定 ASYNC。
+
+因此不能断言异步 I/O 永远只占 async worker，也不能继续把系统描述为单一队列/单一线程池。`AsyncTask::Execute()` 仍是普通同步调用，可阻塞实际执行它的线程。
+
+`TryDequeueAndProcessTask` 根据 `SchedulerProcessPartialSetting` 选择 PROCESS_ALL 或 PROCESS_PARTIAL。后者使 PipelineTask 使用 `PARTIAL_CHUNK_COUNT`（50）的执行预算；预算限制的是执行循环工作量，且推送多输出也可消耗预算，不是精确墙钟时间片、50 个 RowGroup 或严格的源块计数。只有返回 TASK_NOT_FINISHED 时调度器立即重新入队；函数返回空的显式 HAVE_MORE_OUTPUT 并不直接产生一次任务重调度。
+
+## 七、BLOCKED、异常、取消与生命周期
+
+`PipelineTask` 将 INTERRUPTED 转换为 TASK_BLOCKED，保留执行器且不调用 `event->FinishTask()`。调度器随后调用 `ExecutorTask::Deschedule`，Executor 保持强引用。异步完成的 `InterruptState::Callback` 在 TASK 模式下锁定同一任务并 `Reschedule`，再次投入 REGULAR 队列；任务可以迁移线程。若 callback 早于 deschedule，`Executor::RescheduleTask` 循环取锁检查，直到任务登记，或者发现取消退出。这不是持有同一把锁不释放地等待。
+
+BLOCKING 模式通过 `InterruptDoneSignalState` 的条件变量唤醒等待者；NO_INTERRUPTS 调用 Callback 会抛异常。weak_ptr 只保证已销毁任务的回调可成为 no-op，不保证异步任务引用的任意业务对象都安全。
+
+`ExecutorTask::Execute` 捕获异常并 `Executor::PushError`，返回 TASK_ERROR。`CancelTasks` 标记取消、释放已停放任务，清理队列中的未执行任务，并等待已登记任务计数归零，之后才销毁 pipelines/events/states。不能把取消写成强制中断正在进行的阻塞 I/O；具体 I/O 的退出能力仍依赖实现。读前预取另有 `TaskExecutor`/`ScanReadAhead::CancelAndDrain` 生命周期，见[异步协议内部实现](ASYNC_TABLE_SCAN_PROTOCOL_INTERNALS.md)。
+
+## 八、阅读与验证边界
+
+本文描述冻结提交的静态控制流。并行是否生效还取决于物理计划、Source/Sink 能力、线程配置、数据分片与运行时阻塞；没有据此给出吞吐或延迟结论。进一步阅读：[并行扫描](PARALLEL_SCAN_DESIGN.md)、[TableFunction 接口](TABLE_FUNCTION_DESIGN.md)、[异步扫描](ASYNC_TABLE_SCAN_DESIGN.md)。

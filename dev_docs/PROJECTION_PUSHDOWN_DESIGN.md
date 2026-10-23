@@ -1,403 +1,139 @@
 # DuckDB Table Function Projection Pushdown 设计文档
 
-## 一、什么是 Projection Pushdown
+> 适用源码：`v2.0-cyanoptera` @ `c1cd2470a455`；核对日期：2026-10-23。核对方式：静态源码审查，未执行本文示例或性能测试。
 
-**Projection Pushdown（列裁剪下推）** 指优化器将"上层只需要某几列"的信息传递给底层扫描器，使扫描器在读取数据时**只读取实际需要的列**，跳过不需要的列，减少 I/O 和内存开销。
+## 一、三个独立的能力
 
----
+| 能力 | 决定的内容 | 不应推导出的承诺 |
+|---|---|---|
+| `projection_pushdown` | 扫描只需读取并输出请求的列/字段 | 不表示已经实现过滤 |
+| `filter_pushdown` | 数据源接受扫描过滤条件 | 不表示纯过滤列自动不再输出 |
+| `filter_prune` | 可以从 scan 输出中移除只用于扫描内部过滤的列 | 不表示这些列无需读取，也不表示优化器能忽略其谓词 |
 
-## 二、整体流程（从 SQL 到执行）
+能力字段位于 [table_function.hpp](../src/include/duckdb/function/table_function.hpp) 的 `BaseTableFunction`。当前注册对象为 `TableFunction`，已绑定逻辑/物理调用持有 `BoundTableFunction`，二者共享行为字段，但函数签名声明与绑定调用类型分开保存。不能把所有生命周期对象都当成同一个旧 `TableFunction` 结构体。
 
+## 二、从 SQL 到扫描
+
+下面为简化流程，不是实际 EXPLAIN：
+
+```text
+SELECT a FROM t WHERE b > 10
+  → LogicalGet + 上游引用
+  → RemoveUnusedColumns::RemoveColumnsFromLogicalGet
+       扫描所需列可能是 [a,b]
+       输出位置可能是 [0]（b 已完全由 scan 过滤）
+  → PhysicalPlanGenerator::CreatePlan(LogicalGet)
+  → PhysicalTableScan(BoundTableFunction, ColumnIndex列表, projection_ids)
+  → TableFunctionInitInput
+  → 数据源读取/过滤 → 输出 a
 ```
-SQL: SELECT a, b FROM my_table_func(...)
-           ↓ Bind 阶段
-   LogicalGet（包含完整列列表 column_ids = [0,1,2,3...]）
-           ↓ 优化器：RemoveUnusedColumns
-   LogicalGet（column_ids 被裁剪为 [0,1]，仅包含 a, b）
-           ↓ PhysicalPlanGenerator::CreatePlan(LogicalGet)
-   PhysicalTableScan（携带裁剪后的 column_ids 和 projection_ids）
-           ↓ 执行：GetGlobalSourceState / GetLocalSourceState
-   TableFunctionInitInput（column_ids=[0,1] 传给 init_global/init_local）
-           ↓ 扫描函数
-   只读 a, b 两列 → DataChunk
-```
 
----
+如果 `b > 10` 仍留在 scan 上方，b 就仍为上层需要的输出列，不能被 filter_prune 去掉。是否下推以及是否残留见 [FILTER_PUSHDOWN_DESIGN.md](./FILTER_PUSHDOWN_DESIGN.md)。
 
-## 三、关键数据结构
+## 三、列路径、位置和输出映射
 
-### 3.1 `TableFunctionInitInput`
-
-**源文件：** `src/include/duckdb/function/table_function.hpp`
+[TableFunctionInitInput](../src/include/duckdb/function/table_function.hpp) 的真实字段节选：
 
 ```cpp
-struct TableFunctionInitInput {
-    optional_ptr<const FunctionData> bind_data;  // 绑定数据（来自 bind 阶段）
-    vector<column_t>    column_ids;              // 需要读取的列的逻辑索引（原始兼容接口）
-    vector<ColumnIndex> column_indexes;          // 同上，更新版，支持 struct 子字段下推
-    const vector<idx_t> projection_ids;          // 输出列在 column_ids 中的下标（仅在 filter_prune 时非空）
-    optional_ptr<TableFilterSet> filters;        // 下推的过滤条件（filter_pushdown=true 时有效）
-    ...
-    bool CanRemoveFilterColumns() const;         // 是否可以移除纯过滤列（filter_prune 时有用）
-};
+optional_ptr<const FunctionData> bind_data;
+vector<column_t> column_ids;
+vector<ColumnIndex> column_indexes;
+const vector<idx_t> projection_ids;
+optional_ptr<TableFilterSet> filters;
 ```
 
-**`column_ids` 语义：**
-- 当 `projection_pushdown = false`（默认）：`column_ids` 包含所有列，扫描器必须输出全部列，DuckDB 在上层加 Projection 算子做列裁剪。
-- 当 `projection_pushdown = true`：`column_ids` 只包含上层实际需要的列，扫描器**只读取并输出这些列**。
+两个构造重载在 `column_t` 与 `ColumnIndex` 列表间兼容转换；需要子字段、类型和提取信息时使用 `column_indexes`，只看 `column_ids` 会丢失路径语义。当前 `ColumnIndex` 还允许字段名表示，不能对任意对象无条件调用 `GetPrimaryIndex()`。
 
-**`projection_ids` 语义（仅在 `filter_prune = true` 时使用）：**
-- 有些列只用于过滤（WHERE 条件），不需要出现在最终输出中。
-- `column_ids` 包含"需要扫描的列"（包括纯过滤列）。
-- `projection_ids` 是 `column_ids` 的一个子集下标，指向"最终要输出的列"。
-- 扫描函数应先把所有 `column_ids` 对应的列填充到 `all_columns` 缓冲区，再调用 `output.ReferenceColumns(all_columns, projection_ids)` 只输出需要的列。
+[column_index.hpp](../src/include/duckdb/common/column_index.hpp) 的区别：
 
----
+- `FULL_READ`：输出整个请求列；children 可描述内部需读字段。
+- `PUSHDOWN_EXTRACT`：扫描必须直接输出指定 STRUCT/VARIANT 字段，可能带 cast 类型；设置时要求类型信息和单一路径。
+- 一个原表顶层列可以映射成多个提取输出，因此原表列数、扫描列数和输出列数可能不同。
 
-## 四、启用 Projection Pushdown 的标志位
+`projection_ids` 是扫描列表中的**位置**。例如 `column_indexes=[原列7, 原列2, 原列9]`、`projection_ids=[0,2]`，输出顺序为原列7、9。`TableFilterSet` 单列 key 同样为扫描位置 `ProjectionIndex`，不是原始表号。
 
-在注册 `TableFunction` 时设置以下字段：
+`CanRemoveFilterColumns()` 只有在 `projection_ids` 非空且数量少于扫描列数量时返回 true。非空映射也可能只是等长映射，不能把“非空”直接等同于“确有纯过滤列可删”；空映射通常表示按 scan 列顺序输出，而不是零列输出协议。
 
-| 标志位 | 作用 | 默认 |
-|--------|------|------|
-| `projection_pushdown` | 开启列裁剪下推，`column_ids` 只含实际需要的列 | `false` |
-| `filter_pushdown` | 开启过滤下推，`filters` 中含下推的过滤条件 | `false` |
-| `filter_prune` | 开启纯过滤列的裁剪，结合 `projection_ids` 使用 | `false` |
+## 四、优化器裁剪与重映射
 
-> ⚠️ **仅在实现正确支持对应语义时才设置这些标志**，否则会产生错误结果或不必要的 I/O。
+依据：[remove_unused_columns.cpp](../src/optimizer/remove_unused_columns.cpp) 的 `RemoveColumnsFromLogicalGet`。
 
----
+1. `everything_referenced` 或不支持 projection pushdown 时不做该裁剪。
+2. `proj_sel` 记录上游引用；把下推单列过滤还原成逻辑表达式后访问其列，多列统计 filter 的映射列也显式加入引用集合。
+3. `CheckPushdownExtract` 判断扫描是否支持字段提取；根据依赖重建 `ColumnIndex`，必要时把一个顶层列拆成多个直接提取输出。
+4. 设置新列列表，并用旧位置→新位置映射重写单列 filter key 和多列 `column_indexes`。
+5. `filter_prune` 开启时，匹配投影引用和扫描引用，生成 `projection_ids`。
+6. 字段提取改变过滤表达式时，暂时重建 LogicalFilter 再尝试 pushdown；若仍残留上层 filter，清输出映射以保留过滤所需列。
 
-## 五、优化器如何裁剪列：`RemoveUnusedColumns`
+没有实际数据列被引用时，`GetAnyColumn` 提供保持基数所需的扫描请求，不能简单输出零列零行。虚拟列也参与这一机制。
 
-**源文件：** `src/optimizer/remove_unused_columns.cpp`
+## 五、物理规划回退
 
-核心函数 `RemoveColumnsFromLogicalGet(LogicalGet &get)` 的逻辑如下：
+[plan_get.cpp](../src/execution/physical_plan/plan_get.cpp) 的 `PhysicalPlanGenerator::CreatePlan(LogicalGet)`：
 
-1. 若 `get.function.projection_pushdown == false`，直接返回，不做裁剪。
-2. 遍历上层所有表达式，统计哪些列被引用（`column_references`）。
-3. 分别计算：
-   - `proj_sel`：被投影表达式（SELECT 列表）引用的列集合。
-   - `col_sel`：被投影或过滤表达式引用的列集合（`proj_sel` 的超集）。
-4. 用 `col_sel` 重写 `LogicalGet::column_ids`，去除完全未引用的列。
-5. 若 `get.function.filter_prune == true`，计算 `projection_ids`：找出 `col_sel` 中属于 `proj_sel` 的下标并写入 `get.projection_ids`。
+- 普通 scan 携带 `BoundTableFunction`、列路径和 table filters；单列和多列过滤均通过 `MoveTableFilters` 搬入物理计划。
+- `supports_pushdown_type` 可把不支持的类型过滤还原成上层 `PhysicalFilter`，把需要的过滤列补回输出。
+- 不支持 projection pushdown 时，扫描输出全部 returned types，再视请求顺序/子集补一个 `PhysicalProjection`；若本来就是全部列且顺序相同，不需要额外 projection。
+- 此非下推路径不能通用提供虚拟列，请求虚拟列会报 `Virtual columns require projection pushdown`。
+- 带输入 child 的 table-in-out 有自己的 `PhysicalTableInOutFunction` 路径，不等同于无输入的普通 scan。
 
----
+不能从 `LogicalGet::column_ids` 的初始列表直接推断实际磁盘 I/O；最终输出和具体 reader 实现仍需继续跟踪。
 
-## 六、物理计划层：`PhysicalPlanGenerator::CreatePlan(LogicalGet)`
+## 六、执行与本地状态
 
-**源文件：** `src/execution/physical_plan/plan_get.cpp`
+[physical_table_scan.cpp](../src/execution/operator/scan/physical_table_scan.cpp) 在 global/local state 初始化中传递同一组列路径和映射，并合并 runtime filter。具体 `function` 回调得到 bind/global/local state，映射由数据源初始化时保存。
 
-```cpp
-if (!op.function.projection_pushdown) {
-    // 未开启：创建扫描节点（输出全部列），再在上层加 Projection 算子做列选择
-    auto &table_scan = Make<PhysicalTableScan>(
-        op.returned_types, ..., column_ids, /*projection_ids=*/{}, ...);
-    auto &proj = Make<PhysicalProjection>(...);
-    proj.children.push_back(table_scan);
-    return proj;
-}
+`all_columns` 这种可变中间 chunk 应放在每个 local scan state，不能照搬旧示例放在共享 global state 中让多个 worker 同时写。共享 global state 可保存 immutable 映射和列类型，线程调度另行同步。
 
-// 已开启：创建扫描节点，直接只输出需要的列
-auto &table_scan = Make<PhysicalTableScan>(
-    op.types, ..., column_ids, op.projection_ids, ...);
-return table_scan;
+当前 scan 支持异步和 read-ahead，`function` 被调用一次不保证已同步产生结果；列与过滤映射的正确性不依赖回调次数。异步 API 细节由执行框架文档负责，此处不提供未经核对的简化调度实现。
+
+## 七、当前内置实现
+
+### duckdb_views：输出位置与实际列号分离
+
+[duckdb_views.cpp](../src/function/table/system/duckdb_views.cpp) 的 `DuckDBViewsInit` 保存 `input.column_indexes`，`DuckDBViewsFunction` 按请求位置 c 遍历，再按 `GetPrimaryIndex()` 的原始系统列号填充 `output[c]`；注册开启 projection pushdown。这是无子字段系统表的简单案例，不表示所有扫描只能使用数字列号。
+
+### 内置表扫描：filter_prune 与选择性读取分开
+
+[table_scan.cpp](../src/function/table/table_scan.cpp) 的 `DuckTableScanInitGlobal`：
+
+- 将 `input.column_indexes` 交给 `InitializeParallelScan`。
+- `CanRemoveFilterColumns()` 成立时保存 `projection_ids`，按 rowid/row_number、带类型的 extract 或普通列计算 `scanned_types`。
+- 每个 local state 初始化自己的 `all_columns`。
+- `ScanIntoOutput` 等调用先在需要时扫描到 all_columns，再用 `output.ReferenceColumns(all_columns, projection_ids)` 输出子集。
+
+这是输出列裁剪；扫描内部 `Select` 是否只解码选中行，另由 codec/select 回调及 updates 决定，见 [FILTER_EXECUTION_DESIGN.md](./FILTER_EXECUTION_DESIGN.md)。
+
+### Arrow 与多文件
+
+[arrow.cpp](../src/function/table/arrow.cpp) 的普通 Arrow scan 注册 projection/filter/filter_prune，另有 `arrow_dumb` 明确关闭相关能力，说明不能把这些能力归为 Arrow 数据本身必然支持的通用属性。
+
+当前多文件包装见 [table_function_multi_file.cpp](../src/common/multi_file/table_function_multi_file.cpp)：由单文件函数能力组成绑定后的多文件扫描。Parquet 的单文件入口 [read_single_parquet_file.cpp](../extension/parquet/read_single_parquet_file.cpp) 与多文件信息 [parquet_multi_file_info.cpp](../extension/parquet/parquet_multi_file_info.cpp) 共同定义行为。不能沿用旧 `MultiFileFunction<OP>` 构造片段来证明当前默认行为，也不能把 CSV 与 Parquet 的过滤/延迟物化能力相互套用。
+
+## 八、扩展实现骨架
+
+以下仅为按当前字段校正的伪代码，省略函数注册、类型绑定、异常与异步处理，未编译：
+
+```text
+global_init(input):
+  保存 ColumnIndex 请求列表
+  保存 projection_ids 和扫描列类型
+local_init(global):
+  初始化本线程 all_columns 与过滤执行状态
+scan(local):
+  按扫描列表读取；执行所有已完全接受的精确过滤
+  if CanRemoveFilterColumns:
+    output.ReferenceColumns(local.all_columns, projection_ids)
+  else:
+    按 scan 请求顺序直接输出
 ```
 
----
+不要以“扫描时忽略 input.filters，框架随后会补过滤”为兜底。完全下推的谓词可能已从上层计划删除，遗漏执行会给出错误结果。
 
-## 七、执行层：`init_global` / `init_local` / `function`
+C API 的投影能力入口见 [table_function-c.cpp](../src/main/capi/v1/table_function-c.cpp)：`duckdb_table_function_supports_projection_pushdown`、`duckdb_init_get_column_count`、`duckdb_init_get_column_index`。这里只定位入口，没有验证 C API 对所有嵌套字段能力的映射。
 
-**源文件：** `src/execution/operator/scan/physical_table_scan.cpp`
+## 九、虚拟列与审查边界
 
-在 `PhysicalTableScan` 执行时，`column_ids` 和 `projection_ids` 被打包进 `TableFunctionInitInput` 传给扫描函数：
+`COLUMN_IDENTIFIER_ROW_ID` 是保留的虚拟列标识，不能作为普通数组下标，也不能在请求后直接跳过填充；需要按数据源约定输出有效值或明确不支持该能力。行 ID 的稳定性和两次扫描身份一致性影响 [LateMaterialization](./LATE_MATERIALIZATION_DESIGN.md) 正确性，多文件可能需要复合 ID。
 
-```cpp
-// GetGlobalSourceState（单线程，在 Pipeline 就绪时调用一次）
-TableFunctionInitInput input(op.bind_data.get(), op.column_ids, op.projection_ids, filters, ...);
-global_state = op.function.init_global(context, input);
-
-// GetLocalSourceState（每个工作线程调用一次）
-TableFunctionInitInput input(op.bind_data.get(), op.column_ids, op.projection_ids, filters, ...);
-local_state = op.function.init_local(context, input, global_state.get());
-```
-
----
-
-## 八、内置实现示例分析
-
-### 8.1 `duckdb_views`（最简单的系统函数）
-
-**源文件：** `src/function/table/system/duckdb_views.cpp`
-
-```cpp
-// 注册时开启
-duckdb_views.projection_pushdown = true;
-
-// init_global：把 column_indexes 保存到状态中
-unique_ptr<GlobalTableFunctionState> DuckDBViewsInit(ClientContext &, TableFunctionInitInput &input) {
-    auto result = make_uniq<DuckDBViewsData>();
-    result->column_ids = input.column_indexes;  // 只保存实际需要的列
-    return result;
-}
-
-// 扫描函数：只遍历 column_ids，只填充需要的列
-void DuckDBViewsFunction(ClientContext &, TableFunctionInput &data_p, DataChunk &output) {
-    auto &data = data_p.global_state->Cast<DuckDBViewsData>();
-    for (idx_t c = 0; c < data.column_ids.size(); c++) {
-        auto column_id = data.column_ids[c].GetPrimaryIndex(); // 实际列序号
-        switch (column_id) {
-        case 0: output.SetValue(c, count, ...); break; // database_name
-        case 1: output.SetValue(c, count, ...); break; // database_oid
-        // ...
-        }
-    }
-    output.SetCardinality(count);
-}
-```
-
-**关键模式**：`output` 的第 `c` 列对应 `column_ids[c]` 指向的实际列。输出位置（`c`）和实际列序号（`column_id`）解耦。
-
-### 8.2 Arrow 扫描（带 `filter_prune` 的完整模式）
-
-**源文件：** `src/function/table/arrow.cpp`
-
-```cpp
-arrow.projection_pushdown = true;
-arrow.filter_prune = true;
-
-// init_global：处理 filter_prune 情况
-unique_ptr<GlobalTableFunctionState> ArrowScanInitGlobal(ClientContext &, TableFunctionInitInput &input) {
-    auto result = make_uniq<ArrowScanGlobalState>();
-    // 向 Arrow stream 传递投影列（真正的 I/O 优化）
-    result->stream = ProduceArrowScan(bind_data, input.column_ids, input.filters.get());
-
-    if (!input.projection_ids.empty()) {
-        // filter_prune：保存 projection_ids 和扫描列类型（含过滤列）
-        result->projection_ids = input.projection_ids;
-        for (const auto &col_idx : input.column_ids) {
-            result->scanned_types.push_back(bind_data.all_types[col_idx]);
-        }
-    }
-    return result;
-}
-
-// 扫描函数：根据是否有 filter_prune 决定输出方式
-void ArrowScanFunction(ClientContext &, TableFunctionInput &data_p, DataChunk &output) {
-    auto &global_state = data_p.global_state->Cast<ArrowScanGlobalState>();
-
-    if (global_state.CanRemoveFilterColumns()) {
-        // 先填充含过滤列的 all_columns，再裁剪输出
-        state.all_columns.Reset();
-        ArrowToDuckDB(state, ..., state.all_columns);
-        output.ReferenceColumns(state.all_columns, global_state.projection_ids);
-    } else {
-        // 直接填充 output
-        ArrowToDuckDB(state, ..., output);
-    }
-}
-```
-
-### 8.3 DuckDB 内置表扫描（`table_scan`）
-
-**源文件：** `src/function/table/table_scan.cpp`
-
-```cpp
-scan_function.projection_pushdown = true;
-scan_function.filter_prune = true;
-
-// init_global：处理 filter_prune 情况
-if (input.CanRemoveFilterColumns()) {
-    g_state->projection_ids = input.projection_ids;
-    for (const auto &col_idx : input.column_indexes) {
-        g_state->scanned_types.push_back(columns.GetColumn(col_idx.ToLogical()).Type());
-    }
-}
-
-// 扫描函数
-if (CanRemoveFilterColumns()) {
-    l_state.all_columns.Reset();
-    storage.Scan(tx, l_state.all_columns, l_state.scan_state); // 扫描含过滤列
-    output.ReferenceColumns(l_state.all_columns, projection_ids); // 裁剪输出
-} else {
-    storage.Scan(tx, output, l_state.scan_state); // 直接输出
-}
-```
-
-### 8.4 MultiFileFunction（Parquet / CSV 等多文件扫描的基类）
-
-**源文件：** `src/include/duckdb/common/multi_file/multi_file_function.hpp`
-
-```cpp
-template <class OP>
-class MultiFileFunction : public TableFunction {
-    explicit MultiFileFunction(string name_p) : ... {
-        projection_pushdown = true;  // 默认开启
-        // Parquet 扩展额外设置 filter_prune = true
-        // filter_pushdown = true（由各自 pushdown_complex_filter 回调实现）
-    }
-};
-```
-
----
-
-## 九、在自己的 Extension 中支持 Projection Pushdown
-
-### 9.1 最小实现（仅 projection_pushdown）
-
-**步骤 1：注册时开启标志**
-
-```cpp
-TableFunction my_func("my_scan", {LogicalType::VARCHAR}, MyScan, MyBind, MyInitGlobal, MyInitLocal);
-my_func.projection_pushdown = true;  // ← 关键
-```
-
-**步骤 2：`init_global`（或 `init_local`）中保存 `column_ids`**
-
-```cpp
-struct MyGlobalState : public GlobalTableFunctionState {
-    vector<column_t> column_ids; // 保存实际需要的列
-};
-
-unique_ptr<GlobalTableFunctionState> MyInitGlobal(ClientContext &, TableFunctionInitInput &input) {
-    auto state = make_uniq<MyGlobalState>();
-    state->column_ids = input.column_ids; // 只包含上层需要的列
-    return state;
-}
-```
-
-**步骤 3：扫描函数中根据 `column_ids` 只输出请求的列**
-
-```cpp
-void MyScan(ClientContext &context, TableFunctionInput &data_p, DataChunk &output) {
-    auto &state = data_p.global_state->Cast<MyGlobalState>();
-
-    // output 的列数 = column_ids.size()
-    // output[i] 对应 column_ids[i] 所指向的实际列数据
-    for (idx_t i = 0; i < state.column_ids.size(); i++) {
-        auto col_id = state.column_ids[i]; // 实际列序号（对应 bind 时的列顺序）
-
-        if (col_id == COLUMN_IDENTIFIER_ROW_ID) {
-            // 特殊：rowid 伪列请求，填充行号或跳过
-            continue;
-        }
-
-        switch (col_id) {
-        case 0: FillColumn0(output.data[i], ...); break;
-        case 1: FillColumn1(output.data[i], ...); break;
-        // ...
-        }
-    }
-    output.SetCardinality(row_count);
-}
-```
-
-### 9.2 进阶实现（projection_pushdown + filter_prune）
-
-当扫描函数需要读取某些列做过滤但不输出时（例如 `WHERE col3 = 1 SELECT col1, col2`），启用 `filter_prune`：
-
-```cpp
-my_func.projection_pushdown = true;
-my_func.filter_prune        = true;
-my_func.filter_pushdown     = true; // 通常同时开启，否则过滤仍由上层算子执行
-```
-
-```cpp
-struct MyGlobalState : public GlobalTableFunctionState {
-    vector<column_t>    column_ids;      // 所有需要扫描的列（含纯过滤列）
-    vector<idx_t>       projection_ids;  // column_ids 中要输出的列的下标
-    vector<LogicalType> scanned_types;   // 所有扫描列的类型（用于初始化 all_columns）
-    DataChunk           all_columns;     // 扫描所有列（含过滤列）的中间缓冲
-};
-
-unique_ptr<GlobalTableFunctionState> MyInitGlobal(ClientContext &ctx, TableFunctionInitInput &input) {
-    auto state = make_uniq<MyGlobalState>();
-    state->column_ids = input.column_ids;
-
-    if (input.CanRemoveFilterColumns()) { // 存在纯过滤列
-        state->projection_ids = input.projection_ids;
-        for (auto col_id : input.column_ids) {
-            state->scanned_types.push_back(my_schema_types[col_id]);
-        }
-        state->all_columns.Initialize(ctx, state->scanned_types);
-    }
-    return state;
-}
-
-void MyScan(ClientContext &, TableFunctionInput &data_p, DataChunk &output) {
-    auto &state = data_p.global_state->Cast<MyGlobalState>();
-
-    if (!state.projection_ids.empty()) {
-        // filter_prune 模式：先扫描所有列（含过滤列），再裁剪输出
-        state.all_columns.Reset();
-        ScanColumns(state.all_columns, state.column_ids); // 填充全部扫描列
-        output.ReferenceColumns(state.all_columns, state.projection_ids); // 只输出需要的列
-    } else {
-        // 普通 projection_pushdown：直接输出
-        ScanColumns(output, state.column_ids);
-    }
-}
-```
-
-### 9.3 使用 C API（扩展不编写 C++ 时）
-
-```c
-// 注册时启用 projection_pushdown
-duckdb_table_function_supports_projection_pushdown(func, true);
-
-// init 函数中获取需要扫描的列
-idx_t col_count = duckdb_init_get_column_count(info);
-for (idx_t i = 0; i < col_count; i++) {
-    idx_t col_id = duckdb_init_get_column_index(info, i);
-    // col_id == DUCKDB_ROW_ID 表示 rowid 伪列
-    // 否则是 bind 阶段返回的列序号
-}
-```
-
----
-
-## 十、`COLUMN_IDENTIFIER_ROW_ID` 的处理
-
-`column_ids` 中可能出现特殊值 `COLUMN_IDENTIFIER_ROW_ID`（即 `UINT64_MAX`），表示上层需要行 ID（`rowid` 伪列）。扫描函数需特殊处理，**不能将其直接用作数组下标**：
-
-```cpp
-for (idx_t i = 0; i < state.column_ids.size(); i++) {
-    if (state.column_ids[i] == COLUMN_IDENTIFIER_ROW_ID) {
-        // 填充行号（通常是连续递增的行偏移量）
-        FillRowId(output.data[i], ...);
-    } else {
-        // 正常列，按 column_id 取数据
-        FillColumn(output.data[i], state.column_ids[i], ...);
-    }
-}
-```
-
----
-
-## 十一、实现检查清单
-
-| # | 检查项 | 说明 |
-|---|--------|------|
-| ✅ 1 | `my_func.projection_pushdown = true` | 注册时开启标志位 |
-| ✅ 2 | `init_global` 或 `init_local` 中读取并保存 `input.column_ids` | 记录实际需要哪些列 |
-| ✅ 3 | 扫描函数中 `output[i]` 填充 `column_ids[i]` 对应的数据 | 输出位置与实际列索引分离 |
-| ✅ 4 | 处理 `COLUMN_IDENTIFIER_ROW_ID` 特殊值 | 不能直接作为数组下标 |
-| ✅ 5 | `output` 的列数必须等于 `column_ids.size()` | 大小必须严格匹配 |
-| ⚠️ 6 | 若启用 `filter_prune`，需维护 `all_columns` 中间缓冲 | 用 `output.ReferenceColumns(all_columns, projection_ids)` 裁剪 |
-| ⚠️ 7 | 若同时启用 `filter_pushdown`，需在扫描时应用 `input.filters` | 否则过滤下推无效，上层仍会加额外过滤算子 |
-
----
-
-## 十二、相关源码速查
-
-| 概念 | 源文件 |
-|------|--------|
-| 标志位定义及 `TableFunctionInitInput` | `src/include/duckdb/function/table_function.hpp` |
-| 优化器列裁剪（`RemoveColumnsFromLogicalGet`） | `src/optimizer/remove_unused_columns.cpp` |
-| 物理计划生成（`CreatePlan(LogicalGet)`） | `src/execution/physical_plan/plan_get.cpp` |
-| 执行层 `column_ids` 传递 | `src/execution/operator/scan/physical_table_scan.cpp` |
-| 最简内置示例（`duckdb_views`） | `src/function/table/system/duckdb_views.cpp` |
-| `filter_prune` 完整示例（Arrow 扫描） | `src/function/table/arrow.cpp` |
-| `filter_prune` 完整示例（内置表扫描） | `src/function/table/table_scan.cpp` |
-| MultiFile 扫描基类（Parquet/CSV） | `src/include/duckdb/common/multi_file/multi_file_function.hpp` |
-| C API 接口 | `src/main/capi/table_function-c.cpp` |
+本文静态核对了字段、优化器重映射、物理回退、内置/Arrow/多文件入口。未运行扩展示例、SQL 或所有 reader，未由 capability 标志推断实际性能。

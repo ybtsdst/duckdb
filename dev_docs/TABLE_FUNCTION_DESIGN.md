@@ -1,769 +1,183 @@
 # DuckDB TableFunction 接口设计文档
 
-## 概述
+> 适用源码：`v2.0-cyanoptera` @ `c1cd2470a455`；核对日期：2026-10-23。核对方式：静态源码审查，未执行本文示例或性能测试。
 
-本文档整理了 DuckDB `src/include/duckdb/function/table_function.hpp` 中 `TableFunction` 的完整接口定义，详细说明每个方法（回调函数指针）的逻辑含义、调用时机和线程模型，并给出扩展时需要注意的关键事项，为编写自定义表函数（UDTF）或理解内置扫描函数（`read_csv`、`read_parquet` 等）提供参考。
+## 概述与 2.0 对象模型
 
----
+声明以 [table_function.hpp](../src/include/duckdb/function/table_function.hpp) 为准，实现见 [table_function.cpp](../src/function/table_function.cpp)。2.0 将接口拆分成：
 
-## 一、源码文件总览
+- `BaseTableFunction`：回调与能力字段，供注册定义和绑定结果共享，不继承 Function。
+- `TableFunction : BaseTableFunction, SimpleFunction`：注册到目录的名称、签名和行为。既有参数类型 vector/initializer_list 构造器，也有 FunctionSignature 构造器；名称类型为 Identifier。
+- `BoundTableFunction : BaseTableFunction, BoundSimpleFunction`：一次绑定的行为副本、绑定参数类型、原始定义的 shared_ptr。`SetCallArguments` 保存调用参数布局，供序列化重选相同重载。
 
-| 文件 | 说明 |
-|------|------|
-| `src/include/duckdb/function/table_function.hpp` | TableFunction 类及所有相关结构体、回调类型的声明 |
-| `src/function/table_function.cpp` | 构造函数、`operator==`、`Equal` 的实现 |
-| `src/function/table/` | 内置表函数实现（`range`、`query` 等） |
-| `extension/parquet/`、`extension/json/` 等 | 扩展中的表函数实现示例 |
+以下接口表是声明的摘要，不是独立可编译头文件。凡写成骨架的示例均未编译运行，不省略项不代表可在扩展中直接粘贴。
 
----
+## 一、生命周期与线程边界
 
-## 二、执行生命周期总览
-
-`TableFunction` 在一次查询中按以下四个阶段被调用：
-
-```
-SQL 解析
-    │
-    ▼
-1. BIND 阶段（规划期，单线程）
-   bind / bind_replace / bind_operator
-   - 校验参数，决定输出列名与列类型
-   - 返回不可变的 FunctionData（"bind data"）
-    │
-    ▼
-2. GLOBAL INIT 阶段（执行前，单线程）
-   init_global
-   - 分配 GlobalTableFunctionState（跨线程共享）
-   - MaxThreads() 决定并行度
-    │
-    ▼
-3. LOCAL INIT 阶段（每个工作线程一次）
-   init_local
-   - 分配 LocalTableFunctionState（线程私有）
-   - 从全局状态中领取本线程的工作任务
-    │
-    ▼
-4. SCAN 阶段（热循环，每线程反复调用直至耗尽）
-   function（纯源函数）
-   OR in_out_function / in_out_function_final（管道内函数）
-   - 填充 DataChunk，返回空 Chunk 表示 EOF
+```text
+绑定：选择重载 → bind_operator → bind_replace → bind（前者成功可提前返回）
+    ↓
+执行初始化：init_global → GlobalTableFunctionState
+    ↓
+每个执行实例：init_local → LocalTableFunctionState
+    ↓
+多次 function / in_out_function 调用，按各自结果协议推进
+    ↓
+局部状态、全局状态与 bind data 按计划/执行器生命周期销毁
 ```
 
----
+实际绑定分支见 [Binder::BindTableFunction](../src/planner/binder/tableref/bind_table_function.cpp)。`bind_operator` 与 `bind_replace` 不受接口强制互斥：先尝试前者，返回空则可以尝试后者；二者都没有替换时才要求普通 bind。bind 本身可以返回空 FunctionData（无额外数据的函数合法），但仍须给出合法输出列定义。不能将“bind 回调可选”误解成任意 Source 省略 bind 就能自动推断 schema。
 
-## 三、核心结构体
+绑定、优化器及序列化/重新绑定可能重复处理函数，不能承诺“每条 SQL 生命周期内 bind 恰好一次”。初始化发生在执行或调度阶段，并非规划阶段；多个 Pipeline/重复执行还可能重建状态。
 
-### 3.1 TableFunctionInfo
+普通扫描的 `init_local` 按 PipelineExecutor 实例发生，可并发，实例后来也可能迁移 OS 线程。本地状态表示逻辑执行归属，不是永久线程 TLS。全局可变状态需采用适当的同步；原子操作、只读数据和锁各有适用场景，不能要求所有字段一律 mutex。异步任务引用的局部数据也需要单独管理并发和生命周期。
+
+## 二、状态与输入结构
+
+### 2.1 状态对象
+
+| 类型 | 语义 |
+|---|---|
+| TableFunctionInfo | 注册时附加元数据，由 function_info shared_ptr 持有，经 bind input.info 传入；若跨绑定共享可变数据，实现者负责同步 |
+| GlobalTableFunctionState | 本次执行的共享状态；虚方法 `idx_t MaxThreads() const` 默认返回 1，`MAX_THREADS` 常量是 999999999，表示请求尽可能多的线程，仍受 Pipeline 限制 |
+| LocalTableFunctionState | 每个逻辑执行实例的状态；可存 reader、游标、缓冲和耗尽标记 |
+| FunctionData | 绑定/优化配置。执行回调取得 const 指针；规划期仍有合法接收可变 FunctionData 的回调，不能笼统称“bind 返回后任何阶段都不可修改” |
+
+`TableScanGlobalSourceState` 无 init_global 时不创建一个虚构的表函数空状态，而是 global_state 为空、max_threads=1。init_local 可选，返回空时扫描仍会被调用；需要 local_state 的回调必须自行保证非空。实现依据见 [physical_table_scan.cpp](../src/execution/operator/scan/physical_table_scan.cpp) 的两个状态包装器与 `GetDataInternal`。
+
+### 2.2 TableFunctionBindInput
+
+| 字段 | 当前类型/作用 |
+|---|---|
+| inputs | `vector<Value> &`，位置参数值 |
+| named_parameters | `named_argument_map_t &`，命名参数 |
+| input_table_types / input_table_names | `vector<LogicalType> &` / `vector<Identifier> &`，输入关系列 |
+| info / binder | `optional_ptr<TableFunctionInfo>` / `optional_ptr<Binder>` |
+| table_function | `BoundTableFunction &`，正在绑定的调用 |
+| ref | `const TableFunctionRef &`，语法节点 |
+| input_plan | `optional_ptr<unique_ptr<LogicalOperator>>`，可选关系输入计划 |
+| multi_file_input | `optional_ptr<const TableFunctionFileBindInput>`，被多文件扫描包装时的单文件绑定上下文 |
+
+### 2.3 TableFunctionInitInput
+
+`bind_data` 为 optional_ptr<const FunctionData>；`column_ids` 是 vector<column_t>，`column_indexes` 是带子列路径的 vector<ColumnIndex>；两个构造器会从一种形式填充另一种。`projection_ids` 是 **const vector<idx_t> 值成员**；`filters`、`sample_options`、`op` 分别为可选 TableFilterSet、SampleOptions、const PhysicalOperator 指针；`multi_file_input` 提供单文件初始化上下文。
+
+`CanRemoveFilterColumns()` 当 projection_ids 非空且数量少于扫描列数时为 true。扫描器承担 scan schema 到 output schema 的映射；设置 filter_prune 后不能继续原样返回所有过滤列。
+
+### 2.4 TableFunctionInput 与异步协议
+
+| 字段 | 类型与初始状态 |
+|---|---|
+| bind_data | `optional_ptr<const FunctionData>` |
+| local_state / global_state | 可选 LocalTableFunctionState / GlobalTableFunctionState 指针 |
+| async_result | AsyncResult，默认 INVALID；PhysicalTableScan 普通 function 调用前设 IMPLICIT |
+| results_execution_mode | AsyncResultsExecutionMode，结构默认 SYNCHRONOUS，普通扫描调用前按 strategy 覆盖 |
+| interrupt_state | `optional_ptr<const InterruptState>`，仅在调用者支持 Callback 时由普通扫描适配器注入 |
+
+`bool HandleBlocked(AsyncResult &)` 在 TASK_EXECUTOR 下移动结果到本次 input.async_result 并返回 true，表示函数应立即返回；在 SYNCHRONOUS 下执行所带任务并返回 false，表示实现应继续原扫描。它不能给没有任务的自停放结果补出唤醒；taskless BLOCKED 必须由实现者预先登记唤醒，并检查当前模式和 interrupt_state。详见[异步扫描](ASYNC_TABLE_SCAN_DESIGN.md)与[内部协议](ASYNC_TABLE_SCAN_PROTOCOL_INTERNALS.md)。
+
+## 三、绑定、初始化和扫描回调签名
+
+下列是从头文件转写的签名摘要（省略形参名，不是源码逐字摘录）。`unique_ptr<T>` 的返回对象由框架持有。
+
+| 字段（类型别名） | 返回值与参数 | 调用语义 |
+|---|---|---|
+| bind（table_function_bind_t） | `unique_ptr<FunctionData>(ClientContext &, TableFunctionBindInput &, vector<LogicalType> &, vector<Identifier> &)` | 决定输出 types/names 和绑定数据；两者列数需对应 |
+| bind_replace（table_function_bind_replace_t） | `unique_ptr<TableRef>(ClientContext &, TableFunctionBindInput &)` | 以 TableRef 替换调用，空返回可回退 |
+| bind_operator（table_function_bind_operator_t） | `unique_ptr<LogicalOperator>(ClientContext &, TableFunctionBindInput &, TableIndex, vector<Identifier> &)` | 自定义逻辑计划，根列绑定需使用传入 TableIndex |
+| init_global（table_function_init_global_t） | `unique_ptr<GlobalTableFunctionState>(ClientContext &, TableFunctionInitInput &)` | 共享运行状态初始化 |
+| init_local（table_function_init_local_t） | `unique_ptr<LocalTableFunctionState>(ExecutionContext &, TableFunctionInitInput &, GlobalTableFunctionState *)` | 逻辑执行实例初始化 |
+| function（table_function_t） | `void(ClientContext &, TableFunctionInput &, DataChunk &)` | 普通 Source，填 output，状态通过 async_result 表达 |
+| in_out_function（table_in_out_function_t） | `OperatorResultType(ExecutionContext &, TableFunctionInput &, DataChunk &, DataChunk &)` | 接受输入块和输出块；不自动成为 Pipeline Breaker |
+| in_out_function_final（table_in_out_function_final_t） | `OperatorFinalizeResultType(ExecutionContext &, TableFunctionInput &, DataChunk &)` | 输入结束后刷新，可 HAVE_MORE_OUTPUT 多次，不能写成只调用一次 |
+
+普通 Source 的 IMPLICIT 结果通过块大小判定：非空为 HAVE_MORE_OUTPUT，空为 FINISHED。TASK_EXECUTOR 下可显式返回空的 HAVE_MORE_OUTPUT，或者带最终非空块的 FINISHED；同步策略有更严格的块大小检查。SourceResultType 可以通过 AsyncResult 的构造/赋值转换，但自定义代码宜明确使用当前边界的类型。
+
+in-out 有两个不同适配器，必须区分：
+
+- [PhysicalTableScan::GetDataInternal](../src/execution/operator/scan/physical_table_scan.cpp) 可以把常量参数作为一行输入给 in_out_function；仅专门处理其 BLOCKED，其余结果仍主要按 chunk size 推进，源码留有 FIXME。该路径的 final 也不能抽象为全局仅一次。
+- [PhysicalTableInOutFunction](../src/execution/operator/projection/physical_tableinout_function.cpp) 作为普通中间算子处理关系输入，支持直接输入块或按 projected_input 逐行调用；`FinalExecute` 转发 final 回调，并明确拒绝 projected_input 的该收尾路径。此适配器没有像普通 TableScan 那样注入 async mode/interrupt_state，不能复用 Source 异步协议作为通用中间算子阻塞承诺。
+
+## 四、统计、优化和元数据回调
+
+所有类型别名均在 [table_function.hpp](../src/include/duckdb/function/table_function.hpp) 声明，未设置的可选回调默认 nullptr。表中用 `fd` 表示形参名时，其类型仍完整写出。
+
+| 字段 | 返回值与参数摘要 | 职责与边界 |
+|---|---|---|
+| statistics | `unique_ptr<BaseStatistics>(ClientContext &, const FunctionData *, column_t)` | 列统计，未知可空 |
+| statistics_extended | `unique_ptr<BaseStatistics>(ClientContext &, TableFunctionGetStatisticsInput &)` | 使用完整 ColumnIndex 的统计；[StatisticsPropagator::PropagateStatistics](../src/optimizer/statistics/operator/propagate_get.cpp) 优先调用它 |
+| cardinality | `unique_ptr<NodeStatistics>(ClientContext &, const FunctionData *)` | 行数估计，未知可空；不承诺所有估计都精确 |
+| dependency | `void(LogicalDependencyList &, const FunctionData *)` | 记录逻辑/目录依赖；该回调本身不是任意外部资源的保活锁 |
+| pushdown_complex_filter | `void(ClientContext &, LogicalGet &, FunctionData *, vector<unique_ptr<Expression>> &)` | 可消费表达式，剩余表达式仍后置过滤；并不强制要求 filter_pushdown 标志先置 true |
+| pushdown_expression | `bool(ClientContext &, const LogicalGet &, Expression &)` | 判定能否作为 TableFilter 下推 |
+| supports_pushdown_type | `bool(const FunctionData &, idx_t)` | 按列限制过滤下推能力 |
+| supports_pushdown_extract | `bool(const FunctionData &, const LogicalIndex &)` | 控制嵌套字段投影提取支持 |
+| projection_expression_pushdown | `bool(ClientContext &, const TableFunctionProjectionExpressionInput &)` | 扫描器接受 cast/函数投影表达式，成功返回 true；取代旧 type_pushdown 字段 |
+| is_repeatable | `bool(optional_ptr<const FunctionData>)` | 同一查询中相同绑定数据重复执行是否稳定，缺失时保守视为未知 |
+| to_string | `InsertionOrderPreservingMap<string>(TableFunctionToStringInput &)` | ParamsToString 用于 explain/profile 描述，不只在一次 EXPLAIN 中调用 |
+| to_sql | `TableFunctionToSQLResult(ClientContext &, const LogicalGet &)` | 返回未投影 Source 的 TableRef，或 unsupported_reason；源码约定导出时不执行 Source、不产生副作用 |
+| get_metrics | `void(TableFunctionGetMetricsInput &)` | 运行时指标；输入含 context、bind/local/global 状态及 OperatorMetrics 引用；替代旧 dynamic_to_string |
+| table_scan_progress | `double(ClientContext &, const FunctionData *, const GlobalTableFunctionState *)` | 扫描百分比，负值在 PhysicalTableScan::GetProgress 中转为无效进度；共享读也需安全 |
+| get_bind_info | `BindInfo(TableFunctionGetBindInfoInput &)` | 输入含 ClientContext & 与可变 bind_data；BindInfo 含 ScanType、options 和列/嵌套字段标识 |
+| get_table_entry | `optional_ptr<TableCatalogEntry>(optional_ptr<const FunctionData>)` | 此调用扫描的目录表，供 LogicalGet 等定位 |
+| get_multi_file_reader | `unique_ptr<MultiFileReader>(const BoundTableFunction &)` | 注入多文件发现/映射实现 |
+| get_virtual_columns | `virtual_column_map_t(ClientContext &, optional_ptr<FunctionData>)` | 枚举按需可见虚拟列 |
+| get_row_id_columns | `vector<column_t>(ClientContext &, optional_ptr<FunctionData>)` | 行标识列列表 |
+
+过滤实现不能套用旧的多种常量 TableFilter 子类表：当前活动过滤使用 [ExpressionFilter](../src/include/duckdb/planner/filter/expression_filter.hpp)，[TableFilterSet](../src/include/duckdb/planner/table_filter_set.hpp) 独立保存过滤集合并支持多列过滤。复杂下推的实际调用见 [FilterPushdown::PushdownGet](../src/optimizer/pushdown/pushdown_get.cpp)；从表达式列表移除一个条件意味着扫描器负责正确应用它，遗漏会产生错误结果。
+
+`TableFunctionProjectionExpressionInput` 含 `const LogicalGet &get`、`const Expression &expr`、ProjectionIndex column_index，后者是 get.GetColumnIds() 中的位置。当前 cast 分析见 [type_pushdown.cpp](../src/optimizer/type_pushdown.cpp)，实际回调调用见 [type_pushdown.hpp](../src/include/duckdb/optimizer/type_pushdown.hpp) 的 `PushdownOptimize`；不要继续写成向扫描器传 unordered_map<idx_t, LogicalType> 的旧接口。
+
+其他回调的实际调用方包括：[plan_get.cpp](../src/execution/physical_plan/plan_get.cpp) 的物理 Get 规划调用 dependency、拆分不支持的过滤类型；[logical_operator_repeatability.cpp](../src/planner/logical_operator_repeatability.cpp) 的 LogicalGet 分支调用 is_repeatable；[table_function_sql_export.cpp](../src/planner/sql_export/table_function_sql_export.cpp) 的 ReconstructSQLSource 调用 to_sql；[query_profiler.cpp](../src/main/query_profiler.cpp) 的 OperatorProfiler::FinishSource 经 PhysicalTableScan::GetMetrics 调用 get_metrics；[table_function_multi_file.cpp](../src/common/multi_file/table_function_multi_file.cpp) 的单文件绑定路径读取 get_bind_info；[multi_file_reader.cpp](../src/common/multi_file/multi_file_reader.cpp) 的 MultiFileReader::Create 调用 get_multi_file_reader。行标识的实际消费还包括 [LateMaterialization](../src/optimizer/late_materialization.cpp) 的 row-id 获取，不能只解释成 UPDATE/DELETE。
+
+### 分区与扫描顺序
+
+| 字段 | 返回值与参数摘要 | 语义 |
+|---|---|---|
+| get_partition_data | `OperatorPartitionData(ClientContext &, TableFunctionGetPartitionInput &)` | 当前局部位置的 batch index / 分区值；input 含 bind/local/global 和 const OperatorPartitionInfo & |
+| get_partition_info | `TablePartitionInfo(ClientContext &, TableFunctionPartitionInput &)` | 输出分区属性，input 含 bind data 和 partition_ids |
+| get_partition_stats | `vector<PartitionStatistics>(ClientContext &, GetPartitionStatsInput &)` | 分区行偏移、数量和精确性；input 含 const BoundTableFunction & 与 const bind data |
+| set_scan_order | `void(unique_ptr<RowGroupOrderOptions>, optional_ptr<FunctionData>)` | 设置行组扫描顺序 |
+| set_partitions_to_scan | `void(vector<idx_t>, optional_ptr<FunctionData>)` | 按 get_partition_stats 顺序限制扫描分区 |
+
+调用链可从 [LogicalGet::SetScanOrder / SetPartitionsToScan](../src/planner/operator/logical_get.cpp)、[partitioned_execution.cpp](../src/optimizer/partitioned_execution.cpp) 的分区统计调用继续追踪。不同回调报告不同层次的信息；存在 get_partition_data 仅使 PhysicalTableScan::SupportsPartitioning 当前返回 true，源码尚未完整验证所请求分区能力。
+
+## 五、序列化与行为字段默认值
+
+序列化回调当前使用 **BoundTableFunction**，签名摘要：
 
 ```cpp
-struct TableFunctionInfo {
-    virtual ~TableFunctionInfo();
-    template <class TARGET> TARGET &Cast();
-};
+// 签名摘要，未作为独立示例编译。
+void serialize(Serializer &, const optional_ptr<FunctionData>, const BoundTableFunction &);
+unique_ptr<FunctionData> deserialize(Deserializer &, BoundTableFunction &);
 ```
 
-**用途：** 注册函数时附加的静态元数据，通过 `TableFunction::function_info` 持有，并在每次 `bind` 调用时以 `TableFunctionBindInput::info` 传入。
-
-**典型使用场景：** 文件格式变种的选项（如 CSV 分隔符）、插件上下文对象。
-
-**扩展注意：**
-- 子类化后挂载到 `TableFunction::function_info`（`shared_ptr`）。
-- 该对象被所有 `bind` 调用共享，**注册后必须视为只读**，若需可变则自行加锁。
-
----
-
-### 3.2 GlobalTableFunctionState
-
-```cpp
-struct GlobalTableFunctionState {
-    constexpr static int64_t MAX_THREADS = 999999999; // 表示"使用全部可用线程"的哨兵值（与源码中的实际常量一致）
-    virtual ~GlobalTableFunctionState();
-    virtual idx_t MaxThreads() const { return 1; }
-    template <class TARGET> TARGET &Cast();
-};
-```
-
-**用途：** 单次查询执行期间各线程共享的可变状态，由 `init_global` 创建。
-
-**典型内容：**
-- 待扫描的工作单元列表（文件、行组、分区等），用于线程间任务分配。
-- 原子计数器或互斥锁保护的进度指针。
-
-**扩展注意：**
-- `MaxThreads()` 在 `init_global` 调用时被查询一次，用于决定并行线程数。返回 `MAX_THREADS` 表示"使用所有可用线程"，返回 `1` 表示单线程执行。
-- 所有可变字段**必须用 `mutex` 保护**——多线程会并发访问。
-
----
-
-### 3.3 LocalTableFunctionState
-
-```cpp
-struct LocalTableFunctionState {
-    virtual ~LocalTableFunctionState();
-    template <class TARGET> TARGET &Cast();
-};
-```
-
-**用途：** 每个工作线程私有的执行状态，由 `init_local` 创建。
-
-**典型内容：** 当前文件句柄、行组迭代器、线程本地缓冲区。
-
-**扩展注意：**
-- 该状态永远不会被其他线程访问，**无需加锁**。
-- `init_local` 应在此处（持锁地）从 `GlobalTableFunctionState` 中领取本线程的工作片段。若全局已无工作，需将本地状态标记为"已耗尽"，以便 `function()` 立即返回空 Chunk。
-
----
-
-### 3.4 输入辅助结构体
-
-#### TableFunctionBindInput
-
-传递给 `bind` / `bind_replace` / `bind_operator` 回调：
-
-| 字段 | 类型 | 说明 |
-|------|------|------|
-| `inputs` | `vector<Value> &` | 用户传入的位置参数值 |
-| `named_parameters` | `named_parameter_map_t &` | 用户传入的关键字参数 |
-| `input_table_types` | `vector<LogicalType> &` | 输入关系的列类型（仅 in-out 函数） |
-| `input_table_names` | `vector<string> &` | 输入关系的列名（仅 in-out 函数） |
-| `info` | `optional_ptr<TableFunctionInfo>` | 注册时附加的静态元数据 |
-| `binder` | `optional_ptr<Binder>` | 当前活跃的 Binder，可用于子绑定/目录查找 |
-| `table_function` | `TableFunction &` | 正在绑定的 TableFunction 本身 |
-| `ref` | `const TableFunctionRef &` | 解析器产生的原始 AST 节点 |
-
-#### TableFunctionInitInput
-
-传递给 `init_global` 和 `init_local` 回调：
-
-| 字段 | 类型 | 说明 |
-|------|------|------|
-| `bind_data` | `optional_ptr<const FunctionData>` | `bind` 返回的只读数据 |
-| `column_ids` | `vector<column_t>` | 需要物化的列索引列表（兼容接口） |
-| `column_indexes` | `vector<ColumnIndex>` | 含子列路径的列描述符（嵌套格式使用，如 Parquet） |
-| `projection_ids` | `const vector<idx_t>` | 实际需要从扫描算子输出的列子集（用于 `filter_prune`） |
-| `filters` | `optional_ptr<TableFilterSet>` | 下推的过滤谓词（仅当 `filter_pushdown = true`） |
-| `sample_options` | `optional_ptr<SampleOptions>` | 采样参数（仅当 `sampling_pushdown = true`） |
-| `op` | `optional_ptr<const PhysicalOperator>` | 物理算子节点，高级场景使用 |
-
-辅助方法 `CanRemoveFilterColumns()` 返回 `true` 时，表示部分列仅为过滤计算而扫描，可在输出中裁掉（需配合 `filter_prune = true`）。
-
-#### TableFunctionInput
-
-传递给 `function` / `in_out_function` 扫描回调：
-
-| 字段 | 类型 | 说明 |
-|------|------|------|
-| `bind_data` | `optional_ptr<const FunctionData>` | 只读的 bind 数据 |
-| `local_state` | `optional_ptr<LocalTableFunctionState>` | 当前线程的可变本地状态 |
-| `global_state` | `optional_ptr<GlobalTableFunctionState>` | 跨线程共享的可变全局状态 |
-
----
-
-## 四、回调函数接口详解
-
-### 4.1 Bind 阶段
-
-#### `bind`（必须设置）
-
-```cpp
-typedef unique_ptr<FunctionData> (*table_function_bind_t)(
-    ClientContext &context,
-    TableFunctionBindInput &input,
-    vector<LogicalType> &return_types,
-    vector<string> &names);
-```
-
-**调用时机：** 查询规划期，单线程，每次查询调用一次。
-
-**职责：**
-1. 校验 `input.inputs` / `input.named_parameters` 中的参数合法性
-2. 填充 `return_types`（输出列类型）和 `names`（输出列名）
-3. 返回一个 `FunctionData` 子类实例，封装运行时需要的不可变配置
-
-**扩展注意：**
-- 参数非法时应抛出 `BinderException`；
-- 返回的 `FunctionData` 在执行期间**不可再修改**（可变运行时状态应放在 `GlobalTableFunctionState`）；
-- 不应返回 `nullptr`（若要替换整个计划节点，使用 `bind_replace` 或 `bind_operator`）。
-
----
-
-#### `bind_replace`（可选）
-
-```cpp
-typedef unique_ptr<TableRef> (*table_function_bind_replace_t)(
-    ClientContext &context,
-    TableFunctionBindInput &input);
-```
-
-**调用时机：** 早于 `bind`，单线程。若返回非空，则以返回的 `TableRef` 生成逻辑计划，**替换**原来的 `LogicalGet` 节点；若返回 `nullptr`，则回退到 `bind` 正常路径。
-
-**典型使用场景：** 将函数调用完全重写为子查询（如内置的 `query()` 函数用此机制直接展开 SQL 字符串）。
-
-**扩展注意：**
-- `bind_replace` 与 `bind_operator` 互斥，只设一个。
-
----
-
-#### `bind_operator`（可选）
-
-```cpp
-typedef unique_ptr<LogicalOperator> (*table_function_bind_operator_t)(
-    ClientContext &context,
-    TableFunctionBindInput &input,
-    idx_t bind_index,
-    vector<string> &return_names);
-```
-
-**调用时机：** 与 `bind_replace` 相同，但返回的是原始的 `LogicalOperator` 节点，提供更强的计划控制能力。
-
-**扩展注意：** 仅在需要完全自定义逻辑计划节点时使用，大多数情况优先考虑 `bind_replace`。
-
----
-
-### 4.2 初始化阶段
-
-#### `init_global`（可选）
-
-```cpp
-typedef unique_ptr<GlobalTableFunctionState> (*table_function_init_global_t)(
-    ClientContext &context,
-    TableFunctionInitInput &input);
-```
-
-**调用时机：** 执行前，单线程。若未提供则 DuckDB 使用内置的单线程空状态。
-
-**控制并行度：** 返回状态的 `MaxThreads()` 决定并发线程数。
-
-**扩展注意：**
-- 在此处建立所有工作单元队列（如文件列表、行组范围）；
-- 若未设置 `init_global`，则 `init_local` 的 `global_state` 参数为 `nullptr`，扫描默认单线程；
-- 调用时机受 `global_initialization` 枚举控制（见第六节）。
-
----
-
-#### `init_local`（可选）
-
-```cpp
-typedef unique_ptr<LocalTableFunctionState> (*table_function_init_local_t)(
-    ExecutionContext &context,
-    TableFunctionInitInput &input,
-    GlobalTableFunctionState *global_state);
-```
-
-**调用时机：** 每个工作线程启动时，并发调用。
-
-**职责：** 从 `global_state` 中领取本线程的工作片段，初始化本地迭代器/缓冲区。
-
-**扩展注意：**
-- 领取工作片段时需对 `global_state` 加锁；
-- 若全局已无可分配工作，应将本地状态标记为"无工作"，这样后续 `function()` 调用能立即返回空 Chunk 而不会多余地扫描。
-
----
-
-### 4.3 扫描阶段
-
-#### `function`（Source 函数，二者选一）
-
-```cpp
-typedef void (*table_function_t)(
-    ClientContext &context,
-    TableFunctionInput &data,
-    DataChunk &output);
-```
-
-**调用时机：** 每线程反复调用，直至所有线程均返回空 Chunk。
-
-**EOF 信号：** 令 `output` 的行数为 0（即不调用 `output.SetCardinality(N)` 或令 N=0）。
-
-**扩展注意：**
-- 函数体内访问 `data.global_state` 时若需要分配新工作则必须加锁；
-- 每次调用最多填充 `STANDARD_VECTOR_SIZE`（默认 2048）行；
-- 不应与 `in_out_function` 同时设置。
-
----
-
-#### `in_out_function`（In-Out 函数，二者选一）
-
-```cpp
-typedef OperatorResultType (*table_in_out_function_t)(
-    ExecutionContext &context,
-    TableFunctionInput &data,
-    DataChunk &input,
-    DataChunk &output);
-```
-
-**用途：** 既接受输入关系（`input` Chunk）又产出行的"管道内"函数（Pipeline Breaker）。
-
-**返回值语义：**
-
-| 返回值 | 含义 |
-|--------|------|
-| `NEED_MORE_INPUT` | 当前 input Chunk 已处理完，需要下一个 |
-| `HAVE_MORE_OUTPUT` | 当前 input 还可以产出更多 output，不需要新 input |
-| `BLOCKED` | 异步阻塞，任务暂停并等待回调重新调度 |
-| `FINISHED` | 函数执行完毕 |
-
----
-
-#### `in_out_function_final`（In-Out 收尾，可选）
-
-```cpp
-typedef OperatorFinalizeResultType (*table_in_out_function_final_t)(
-    ExecutionContext &context,
-    TableFunctionInput &data,
-    DataChunk &output);
-```
-
-**调用时机：** 所有输入已消费完毕后调用一次，用于刷新内部缓冲。返回 `FINISHED` 表示完成。
-
----
-
-### 4.4 统计与优化阶段
-
-#### `statistics`（可选）
-
-```cpp
-typedef unique_ptr<BaseStatistics> (*table_statistics_t)(
-    ClientContext &context,
-    const FunctionData *bind_data,
-    column_t column_index);
-```
-
-**用途：** 返回指定列的统计信息（最小值、最大值、NULL 计数等），供优化器用于过滤选择率估计。
-
-**扩展注意：** 无法获取时返回 `nullptr`；统计信息不必精确，近似值同样有益。
-
----
-
-#### `cardinality`（可选）
-
-```cpp
-typedef unique_ptr<NodeStatistics> (*table_function_cardinality_t)(
-    ClientContext &context,
-    const FunctionData *bind_data);
-```
-
-**用途：** 估算输出行数（可标记为精确或近似），优化器用于 Join 顺序决策与哈希表内存预分配。
-
-**扩展注意：** 哪怕粗略估计也比 `nullptr` 好；`nullptr` 表示完全未知。
-
----
-
-#### `dependency`（可选）
-
-```cpp
-typedef void (*table_function_dependency_t)(
-    LogicalDependencyList &dependencies,
-    const FunctionData *bind_data);
-```
-
-**用途：** 向 `dependencies` 列表中注册本函数依赖的目录对象（基础表、序列等）。
-
-**扩展注意：** 若不声明依赖，DuckDB 可能在查询仍在运行时允许 `DROP TABLE`，导致访问悬空引用。
-
----
-
-### 4.5 Filter 下推
-
-#### `pushdown_complex_filter`（可选）
-
-```cpp
-typedef void (*table_function_pushdown_complex_filter_t)(
-    ClientContext &context,
-    LogicalGet &get,
-    FunctionData *bind_data,
-    vector<unique_ptr<Expression>> &filters);
-```
-
-**前提：** `filter_pushdown = true`。
-
-**用途：** 接收任意过滤表达式列表。函数可将能处理的表达式从 `filters` 中移除（函数内部处理），剩余的由 DuckDB 在扫描后追加过滤算子。
-
-**⚠️ 关键注意：** 从列表中移除表达式意味着**函数必须保证该条件**——若移除后实际未过滤，则会产生语义错误的结果。不确定时保留在列表中（慢但正确，不影响结果正确性）。
-
----
-
-#### `pushdown_expression`（可选）
-
-```cpp
-typedef bool (*table_function_pushdown_expression_t)(
-    ClientContext &context,
-    const LogicalGet &get,
-    Expression &expr);
-```
-
-**用途：** 细粒度判断单个表达式是否能被转换为 `TableFilter` 下推。返回 `true` 则允许下推，`false` 则保留为后置过滤。
-
----
-
-#### `supports_pushdown_type`（可选）
-
-```cpp
-typedef bool (*table_function_supports_pushdown_type_t)(
-    const FunctionData &bind_data,
-    idx_t col_idx);
-```
-
-**用途：** 在 `filter_pushdown = true` 的前提下，进一步限制哪些列支持过滤下推。返回 `false` 表示该列的过滤仍作为后置算子处理。
-
----
-
-### 4.6 类型与投影下推
-
-#### `type_pushdown`（可选）
-
-```cpp
-typedef void (*table_function_type_pushdown_t)(
-    ClientContext &context,
-    optional_ptr<FunctionData> bind_data,
-    const unordered_map<idx_t, LogicalType> &new_column_types);
-```
-
-**用途：** 优化器发现某列实际使用类型比声明类型更窄时（如 CAST 折叠），通知扫描器以更窄的类型直接读取，减少类型转换开销。
-
----
-
-### 4.7 输出字符串（EXPLAIN / Profile）
-
-#### `to_string`（可选）
-
-```cpp
-typedef InsertionOrderPreservingMap<string> (*table_function_to_string_t)(
-    TableFunctionToStringInput &input);
-```
-
-**调用时机：** 执行前（EXPLAIN 阶段），只能访问 `bind_data`。
-
-**用途：** 返回键值对映射，显示在 `EXPLAIN` 输出和查询 Profile 中（如扫描文件路径、选项）。
-
----
-
-#### `dynamic_to_string`（可选）
-
-```cpp
-typedef InsertionOrderPreservingMap<string> (*table_function_dynamic_to_string_t)(
-    TableFunctionDynamicToStringInput &input);
-```
-
-**调用时机：** 执行后（Profile 阶段），可访问 `bind_data`、`local_state`、`global_state`。
-
-**用途：** 在 Profile 中追加运行时统计（已读行数、扫描字节数、缓存命中率等）。
-
----
-
-### 4.8 进度与分区
-
-#### `table_scan_progress`（可选）
-
-```cpp
-typedef double (*table_function_progress_t)(
-    ClientContext &context,
-    const FunctionData *bind_data,
-    const GlobalTableFunctionState *global_state);
-```
-
-**用途：** 返回 `[0, 100]` 的扫描进度百分比，用于进度条和 `duckdb_progress()` 系统函数。
-
-**扩展注意：** 无法计算时返回 `-1`；此函数可能被高频调用，不应有阻塞操作。
-
----
-
-#### `get_partition_data`（可选）
-
-```cpp
-typedef OperatorPartitionData (*table_function_get_partition_data_t)(
-    ClientContext &context,
-    TableFunctionGetPartitionInput &input);
-```
-
-**用途：** 返回当前本地扫描线程所处位置对应的分区数据（如排序键列值），供分区 Pipeline 基础设施将行路由到正确的分区。
-
----
-
-#### `get_partition_info`（可选）
-
-```cpp
-typedef TablePartitionInfo (*table_function_get_partition_info_t)(
-    ClientContext &context,
-    TableFunctionPartitionInput &input);
-```
-
-**用途：** 描述扫描输出本身的分区特性（如已按某列排序），优化器据此避免在扫描节点上方插入冗余的重分区算子。
-
----
-
-#### `get_partition_stats`（可选）
-
-```cpp
-typedef vector<PartitionStatistics> (*table_function_get_partition_stats_t)(
-    ClientContext &context,
-    GetPartitionStatsInput &input);
-```
-
-**用途：** 返回每个分区的统计信息（行起始偏移、行数、行数精确性）。用于：
-- Zone Map / Min-Max 过滤（分区级）
-- 自适应并行执行时的分区均衡分配
-
----
-
-### 4.9 虚拟列与行 ID
-
-#### `get_virtual_columns`（可选）
-
-```cpp
-typedef virtual_column_map_t (*table_function_get_virtual_columns_t)(
-    ClientContext &context,
-    optional_ptr<FunctionData> bind_data);
-```
-
-**用途：** 枚举扫描器能按需合成的虚拟列（如 `row_id`、`filename`、`file_row_number`）。这些列不在声明的输出 Schema 中，但可出现在 `SELECT` 列表或 `WHERE` 子句里。
-
----
-
-#### `get_row_id_columns`（可选）
-
-```cpp
-typedef vector<column_t> (*table_function_get_row_id_columns)(
-    ClientContext &context,
-    optional_ptr<FunctionData> bind_data);
-```
-
-**用途：** 返回构成本扫描逻辑行标识符的列索引列表，用于 `UPDATE` / `DELETE` 语句的重写（将目标行定位回源数据）。
-
----
-
-### 4.10 MultiFileReader 扩展
-
-#### `get_multi_file_reader`（可选）
-
-```cpp
-typedef unique_ptr<MultiFileReader> (*table_function_get_multi_file_reader_t)(const TableFunction &);
-```
-
-**用途：** 注入自定义 `MultiFileReader` 实现。若不设置，DuckDB 使用内置的默认实现（支持通配符、Hive 分区等）。
-
-**适用场景：** 需要特殊文件发现逻辑（如从对象存储列表 API 获取文件列表）的扫描函数。
-
----
-
-### 4.11 序列化
-
-#### `serialize` / `deserialize`（可选，需成对设置）
-
-```cpp
-typedef void (*table_function_serialize_t)(
-    Serializer &serializer,
-    const optional_ptr<FunctionData> bind_data,
-    const TableFunction &function);
-
-typedef unique_ptr<FunctionData> (*table_function_deserialize_t)(
-    Deserializer &deserializer,
-    TableFunction &function);
-```
-
-**用途：** 将 `bind_data` 持久化到序列化流，以支持预编译语句缓存和查询跨进程复用。
-
-**扩展注意：**
-- 两个函数**必须成对设置**，缺一不可；
-- `deserialize` 返回的数据必须与原始 `bind` 调用对相同参数时的结果语义等价；
-- `verify_serialization = true`（默认）时，DuckDB 会在调试模式下验证序列化正确性。
-
----
-
-### 4.12 元数据查询
-
-#### `get_bind_info`（可选）
-
-```cpp
-typedef BindInfo (*table_function_get_bind_info_t)(
-    const optional_ptr<FunctionData> bind_data);
-```
-
-**用途：** 返回 `BindInfo` 描述符（含 `ScanType` 和 options 键值对），供 `EXPLAIN` 和优化器规则检查扫描元数据。
-
----
-
-## 五、TableFunction 类字段速查
-
-### 5.1 回调函数指针
-
-| 字段名 | 类型别名 | 是否必须 | 说明 |
-|--------|----------|----------|------|
-| `bind` | `table_function_bind_t` | ✅ 必须 | 参数校验 + 输出 Schema + 返回 bind data |
-| `bind_replace` | `table_function_bind_replace_t` | 可选 | 返回 TableRef 替换整个计划节点（与 bind_operator 二选一） |
-| `bind_operator` | `table_function_bind_operator_t` | 可选 | 返回自定义 LogicalOperator（与 bind_replace 二选一） |
-| `init_global` | `table_function_init_global_t` | 可选 | 分配跨线程共享状态，决定并行度 |
-| `init_local` | `table_function_init_local_t` | 可选 | 分配线程本地状态，领取工作片段 |
-| `function` | `table_function_t` | ✅（与 in_out 二选一） | 纯源扫描主循环 |
-| `in_out_function` | `table_in_out_function_t` | 可选（与 function 二选一） | 管道内 in-out 扫描循环 |
-| `in_out_function_final` | `table_in_out_function_final_t` | 可选 | in-out 函数的收尾刷新 |
-| `statistics` | `table_statistics_t` | 可选 | 返回列统计信息 |
-| `dependency` | `table_function_dependency_t` | 可选 | 声明目录依赖项 |
-| `cardinality` | `table_function_cardinality_t` | 可选 | 估算输出行数 |
-| `pushdown_complex_filter` | `table_function_pushdown_complex_filter_t` | 可选 | 消费/改写任意过滤表达式 |
-| `pushdown_expression` | `table_function_pushdown_expression_t` | 可选 | 判断单个表达式是否可下推 |
-| `to_string` | `table_function_to_string_t` | 可选 | EXPLAIN 输出（执行前） |
-| `dynamic_to_string` | `table_function_dynamic_to_string_t` | 可选 | Profile 输出（执行后，含运行时统计） |
-| `table_scan_progress` | `table_function_progress_t` | 可选 | 返回扫描进度 [0,100]，-1 表示未知 |
-| `get_partition_data` | `table_function_get_partition_data_t` | 可选 | 当前线程位置的分区数据 |
-| `get_bind_info` | `table_function_get_bind_info_t` | 可选 | 返回 BindInfo 元数据描述符 |
-| `type_pushdown` | `table_function_type_pushdown_t` | 可选 | 接受优化器推断的更窄列类型 |
-| `get_multi_file_reader` | `table_function_get_multi_file_reader_t` | 可选 | 注入自定义 MultiFileReader |
-| `supports_pushdown_type` | `table_function_supports_pushdown_type_t` | 可选 | 细粒度控制哪些列支持 filter 下推 |
-| `get_partition_info` | `table_function_get_partition_info_t` | 可选 | 描述输出分区特性 |
-| `get_partition_stats` | `table_function_get_partition_stats_t` | 可选 | 每分区统计信息（行偏移 + 行数） |
-| `get_virtual_columns` | `table_function_get_virtual_columns_t` | 可选 | 枚举可按需合成的虚拟列 |
-| `get_row_id_columns` | `table_function_get_row_id_columns` | 可选 | 构成行 ID 的列索引列表 |
-| `serialize` | `table_function_serialize_t` | 可选（与 deserialize 成对） | 序列化 bind data |
-| `deserialize` | `table_function_deserialize_t` | 可选（与 serialize 成对） | 反序列化 bind data |
-
-### 5.2 Pushdown 标志位
-
-| 字段名 | 类型 | 默认 | 语义 |
-|--------|------|------|------|
-| `projection_pushdown` | `bool` | `false` | 为 `true` 时，`init_global/init_local` 的 `column_ids` 仅包含实际需要的列，扫描器跳过其余列以减少 I/O |
-| `filter_pushdown` | `bool` | `false` | 为 `true` 时，`init_global/init_local` 的 `filters` 包含下推的过滤条件，扫描器在读取时直接过滤 |
-| `filter_prune` | `bool` | `false` | 为 `true` 时，仅用于过滤的列不需要出现在输出中，需配合 `CanRemoveFilterColumns()` 使用 |
-| `sampling_pushdown` | `bool` | `false` | 为 `true` 时，采样参数下推给扫描器处理，而不是在扫描后再采样 |
-| `late_materialization` | `bool` | `false` | 为 `true` 时，支持延迟物化（先通过行 ID 过滤，再按需取列值） |
-
-**⚠️ 关键注意：** 以上标志位设为 `true`、但实现未正确处理时，将产生**错误结果或不必要的数据传输**。仅在实现确实遵守相应语义时才开启。
-
-### 5.3 其他字段
-
-| 字段名 | 类型 | 说明 |
-|--------|------|------|
-| `function_info` | `shared_ptr<TableFunctionInfo>` | 注册时附加的静态元数据，传递给 bind |
-| `verify_serialization` | `bool` | 默认 `true`，在调试模式下校验序列化一致性 |
-| `global_initialization` | `TableFunctionInitialization` | 控制 `init_global` 的调用时机（见下节） |
-
----
-
-## 六、TableFunctionInitialization 枚举
-
-```cpp
-enum class TableFunctionInitialization {
-    INITIALIZE_ON_EXECUTE,   // 默认：Pipeline 就绪时调用 init_global
-    INITIALIZE_ON_SCHEDULE,  // Pipeline 调度时（查询规划后立即）调用 init_global
-};
-```
-
-| 枚举值 | 调用时机 | 适用场景 |
-|--------|----------|----------|
-| `INITIALIZE_ON_EXECUTE`（默认） | Pipeline 即将开始执行时 | 绝大多数场景 |
-| `INITIALIZE_ON_SCHEDULE` | 查询首次被调度时，早于所有 Pipeline 执行 | `init_global` 有较高延迟（如建立远程连接），需要提前隐藏延迟 |
-
----
-
-## 七、扩展实现指南
-
-### 7.1 最小可用示例
-
-```cpp
-// 1. 定义 bind data（不可变配置）
-struct MyBindData : public FunctionData {
-    string file_path;
-    unique_ptr<FunctionData> Copy() const override {
-        auto result = make_uniq<MyBindData>();
-        result->file_path = file_path;
-        return result;
-    }
-    bool Equals(const FunctionData &other) const override {
-        return file_path == other.Cast<MyBindData>().file_path;
-    }
-};
-
-// 2. 定义全局状态（线程间共享，需加锁）
-struct MyGlobalState : public GlobalTableFunctionState {
-    mutex lock;
-    vector<string> files;
-    idx_t file_index = 0;
-
-    idx_t MaxThreads() const override {
-        return files.size(); // 每个文件一个线程
-    }
-};
-
-// 3. 定义本地状态（线程私有）
-struct MyLocalState : public LocalTableFunctionState {
-    string current_file;
-    bool exhausted = false;
-};
-
-// 4. 实现 bind
-static unique_ptr<FunctionData> MyBind(
-        ClientContext &context, TableFunctionBindInput &input,
-        vector<LogicalType> &return_types, vector<string> &names) {
-    auto result = make_uniq<MyBindData>();
-    result->file_path = input.inputs[0].GetValue<string>();
-    // 填充输出 Schema
-    return_types = { LogicalType::VARCHAR };
-    names = { "line" };
-    return result;
-}
-
-// 5. 实现 init_global
-static unique_ptr<GlobalTableFunctionState> MyInitGlobal(
-        ClientContext &context, TableFunctionInitInput &input) {
-    auto &bind_data = input.bind_data->Cast<MyBindData>();
-    auto state = make_uniq<MyGlobalState>();
-    state->files = { bind_data.file_path }; // 简化：单文件
-    return state;
-}
-
-// 6. 实现 init_local（从全局状态领取工作）
-static unique_ptr<LocalTableFunctionState> MyInitLocal(
-        ExecutionContext &context, TableFunctionInitInput &input,
-        GlobalTableFunctionState *global_state) {
-    auto &gstate = global_state->Cast<MyGlobalState>();
-    auto lstate = make_uniq<MyLocalState>();
-    lock_guard<mutex> lock(gstate.lock);
-    if (gstate.file_index < gstate.files.size()) {
-        lstate->current_file = gstate.files[gstate.file_index++];
-    } else {
-        lstate->exhausted = true;
-    }
-    return lstate;
-}
-
-// 7. 实现主扫描函数
-static void MyScan(ClientContext &context, TableFunctionInput &data, DataChunk &output) {
-    auto &lstate = data.local_state->Cast<MyLocalState>();
-    if (lstate.exhausted) return; // 空 Chunk = EOF
-    // ... 读取 lstate.current_file 并填充 output ...
-    lstate.exhausted = true; // 示例：读完即标记
-}
-
-// 8. 注册
-// TableFunction 构造函数参数顺序：(函数名, 位置参数类型列表, 扫描函数, bind, init_global, init_local)
-// 后三个回调可省略（传 nullptr），但省略 bind 时输出 Schema 将为空。
-TableFunction MyFunction("my_scan", { LogicalType::VARCHAR }, MyScan, MyBind, MyInitGlobal, MyInitLocal);
-MyFunction.projection_pushdown = true;
-```
-
-### 7.2 常见陷阱
-
-| 陷阱 | 后果 | 解决方案 |
-|------|------|----------|
-| 修改 `FunctionData`（bind data）中的字段 | 多线程并发读写，数据竞争 | 将可变状态移入 `GlobalTableFunctionState` |
-| `GlobalTableFunctionState` 无锁并发写 | 数据竞争、结果错误 | 用 `mutex` 保护所有可变字段 |
-| `pushdown_complex_filter` 中错误地移除了无法处理的表达式 | 查询返回错误结果（过滤失效） | 仅移除**确保能处理**的表达式 |
-| 设置 `filter_pushdown = true` 但不使用 `filters` | 无安全问题，但下推无效（额外增加了过滤算子） | 在 `init_global/init_local` 中读取并应用 `input.filters` |
-| `serialize`/`deserialize` 只实现一个 | 序列化功能静默失效 | 总是成对实现 |
-| `init_local` 不加锁地读取全局工作队列 | 多线程数据竞争，工作片段重复分配 | 在 `init_local` 中对 `global_state` 加锁 |
-
----
-
-## 八、文件源码位置速查
-
-| 概念 | 关键源文件 |
-|------|-----------|
-| TableFunction 接口定义 | `src/include/duckdb/function/table_function.hpp` |
-| TableFunction 基础实现 | `src/function/table_function.cpp` |
-| 内置表函数（range、query 等） | `src/function/table/` |
-| Parquet 扫描函数 | `extension/parquet/` |
-| JSON 扫描函数 | `extension/json/` |
-| 绑定流程入口 | `src/planner/binder/tableref/bind_table_function.cpp` |
-| 物理扫描算子 | `src/execution/operator/scan/physical_table_scan.cpp` |
-| MultiFileReader | `src/include/duckdb/common/multi_file/multi_file_reader.hpp` |
-| C API 绑定（扩展接口） | `src/main/capi/table_function-c.cpp` |
+`BaseTableFunction::HasSerializationCallbacks()` 仅在二者都非空时为 true。需成对提供以支持专用 bind-data 序列化；未成对时不是这里自动抛异常。实际计划路径见 [LogicalGet::Serialize / Deserialize](../src/planner/operator/logical_get.cpp) 与 [FunctionSerializer](../src/include/duckdb/function/function_serialization.hpp)。有些调用保存参数供重新绑定，有些含进程本地绑定输入会拒绝序列化，不能承诺任何表函数都可跨进程复用。verify_serialization 默认 true 仅表示参与相关验证逻辑，不是生产环境自动验证所有序列化的保证。
+
+| 字段 | 默认值 | 意义 |
+|---|---|---|
+| projection_pushdown | false | 支持按实际请求列扫描；否则由计划追加投影 |
+| filter_pushdown | false | 承担下推 TableFilter 的过滤责任；开启却忽略 filters 可能返回错误结果 |
+| filter_prune | false | 支持不输出仅用于过滤的列，需正确应用 projection_ids |
+| sampling_pushdown | false | 承担下推采样语义 |
+| late_materialization | false | 声明支持延迟物化相关规划 |
+| verify_serialization | true | 序列化验证能力开关 |
+| return_type | TABLE_RETURNING_FUNCTION | 另有 SET_RETURNING_FUNCTION |
+| call_return_type | QUERY_RESULT | CALL 的结果类型；仅副作用调用可声明 NOTHING |
+| order_preservation_type | INSERTION_ORDER | 输出保序能力，不能替代 SQL 全局排序 |
+| global_initialization | INITIALIZE_ON_EXECUTE | 可改为 INITIALIZE_ON_SCHEDULE |
+| parallelism | SELF_MANAGED_PARALLELISM | 另有 SEQUENTIAL、FORCE_SINGLE_THREADED；实际并行度仍由 Pipeline 能力和状态决定 |
+| function_info | 空 shared_ptr | 共享注册元数据 |
+
+`INITIALIZE_ON_SCHEDULE` 由 [BuildPipelineSchedule](../src/parallel/pipeline_schedule.cpp) 收集，`Executor::ScheduleEventsInternal` 在启动事件前 ResetSource(true)；默认在普通 Pipeline::Schedule 的 Reset 中创建 Source 状态。这是初始化先后顺序，不能据此推导远程连接异步建立或必定隐藏延迟。
+
+## 六、扩展实现检查要点
+
+1. 用当前 Identifier/TableIndex/BoundTableFunction 等签名实现回调；不要沿用 vector<string> 名称、idx_t bind_index、dynamic_to_string 或 type_pushdown。
+2. 将运行游标放入状态，明确无工作标记；不要用 init_local 返回空指针阻止框架调用 function。
+3. 共享工作分配需同步，异步任务必须在对象销毁前完成或 drain；局部执行对象可迁移线程。
+4. 普通同步函数可保留 IMPLICIT，直至非空输出或真实 EOF；需要异步时遵守 mode、块大小与唤醒协议。
+5. 只声明已实现的 pushdown 能力；复杂过滤保留未处理条件。
+6. 本轮仅核对静态接口和调用链，扩展编译、过滤结果、重复执行、取消、并行顺序仍需独立验证。
+
+并行状态的伪代码见[并行扫描](PARALLEL_SCAN_DESIGN.md)，BLOCKED 的实现骨架见[异步扫描](ASYNC_TABLE_SCAN_DESIGN.md)。C API 的实现路径已移至 [src/main/capi/v1/table_function-c.cpp](../src/main/capi/v1/table_function-c.cpp)，不能将 C++ 私有接口签名套用于 C API。

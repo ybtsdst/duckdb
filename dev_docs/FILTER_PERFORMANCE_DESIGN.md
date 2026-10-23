@@ -1,214 +1,91 @@
 # DuckDB Filter 性能优化设计文档
 
-> 本文是 `FILTER_DESIGN.md` 系列的第 4 篇,集中讲 **7 类性能优化机制**:zone-map 3VL 边界、SelectionVector + late mat、TopN DynamicFilter、Optional / SelectivityOptional、Bloom × stats 联合裁剪、FilterCombiner 传递性的扫描端收益、ExpressionFilter 兜底代价。末尾一个端到端 SQL 例子串起前三篇的概念。
->
-> 类层次见 [FILTER_DESIGN.md](./FILTER_DESIGN.md);规划期转换见 [FILTER_PUSHDOWN_DESIGN.md](./FILTER_PUSHDOWN_DESIGN.md);扫描期执行见 [FILTER_EXECUTION_DESIGN.md](./FILTER_EXECUTION_DESIGN.md)。
+> 适用源码：`v2.0-cyanoptera` @ `c1cd2470a455`；核对日期：2026-10-23。核对方式：静态源码审查，未执行本文示例或性能测试。
 
-## §5 性能优化机制
+## 范围与证据
 
-### 5.1 Zone-map 剪枝(CheckStatistics)与 3VL 边界
+本文是 [Filter 系列](./FILTER_DESIGN.md) 的性能机制篇。以下均为静态源码机制及有条件的成本推断，不是本轮实测。旧文档中的固定加速倍数、延迟和输出行数没有可复核实验依据，不能据此用于性能比较。
 
-`FilterPropagateResult` 5 个枚举值(`src/include/duckdb/common/enums/filter_propagate_result.hpp:15-21`):
+## 一、统计剪枝：收益来自能证明排除的数据范围
 
-```cpp
-enum class FilterPropagateResult : uint8_t {
-    NO_PRUNING_POSSIBLE = 0,
-    FILTER_ALWAYS_TRUE = 1,
-    FILTER_ALWAYS_FALSE = 2,
-    FILTER_TRUE_OR_NULL = 3,
-    FILTER_FALSE_OR_NULL = 4
-};
+[ExpressionFilter::CheckExpressionStatistics](../src/planner/filter/expression_filter.cpp) 通过表达式和子统计推导判断结果，包含比较、IN/NULL/NOT、AND/OR、BOOLEAN 引用、函数 prune callback 等路径。当前 `ExpressionFilter` 同时承担普通比较和复杂表达式，不能把它等同于“无法 zone-map 的兜底”。
+
+[RowGroup::CheckZonemap](../src/storage/table/row_group.cpp) 对 FALSE / FALSE_OR_NULL 跳过行组，对精确 ALWAYS_TRUE 免去相应行级过滤。TRUE_OR_NULL 仍可能有 WHERE 不接受的 NULL，不可直接全放行。受限多列表达式也可在行组级联合推导统计；原始行级谓词仍保留。
+
+更窄、与谓词范围更一致的统计更可能剪枝。数据聚簇、行组大小、分布和 NULL 都会影响收益；不能声称 TPC-H dbgen 输出默认按 `l_shipdate` 聚簇。非聚簇列也可能遇到完全不相交的区段，只是常见的宽 min/max 会降低机会。
+
+跳过行组减少后续扫描/解码，具体物理 I/O 还受缓存、元数据、预取和读取粒度影响。未测量时不宜写“每次必省多少 MB”。
+
+## 二、SelectionVector 与延后读取
+
+[RowGroup::ProcessPreparedScan](../src/storage/table/row_group.cpp) 先执行 active filter 列，用同一个选择集合逐步缩小候选，再读取其它列。整批零命中时可跳过其余列；部分命中时调用 `ColumnData::Select`。
+
+这个机制能减少后续计算和输出数据，但部分命中的解码成本有严格条件：
+
+- [ColumnData::Select](../src/storage/table/column_data.cpp) 的基础路径为完整 `Scan` 后 `Slice`。
+- [StandardColumnData::Select](../src/storage/table/standard_column_data.cpp) 只有数据和 validity codec 均实现 select 且无 updates 才使用专门选择路径。
+- codec 内部读取/解码粒度可能仍大于选中行粒度。
+
+因此不可由“命中率1%”直接推出“解压量1%”或固定10倍加速。还要与 [LateMaterialization](./LATE_MATERIALIZATION_DESIGN.md) 的两次扫描/行 ID 改写区分。
+
+## 三、快速行级执行与自适应顺序
+
+[table_filter_state.cpp](../src/planner/table_filter_state.cpp) 的 `TryCreateFastExecutor` 识别简单比较、部分 AND 和内部运行期过滤函数。`ComparisonFilterExecutor` 用类型、比较符和 NULL 状态特化循环；未命中则使用 `ExpressionExecutor`，其中某些函数仍有专门 select callback。因此“通用表达式没有模板化/向量内核”同样过于绝对。
+
+[AdaptiveFilter](../src/execution/adaptive_filter.cpp) 以整个过滤阶段的耗时试探相邻交换，不能理解为精确的每列选择率排序。有抛错或 barrier 时禁用重排。更早收窄候选集合可能降低后续谓词工作量；实际是否更快取决于内核成本、数据局部性、解码和批大小，不能承诺找到最优 permutation。
+
+## 四、Optional 与 selectivity optional
+
+当前二者均为 `ExpressionFilter` 内部函数，声明见 [table_filter_functions.hpp](../src/include/duckdb/planner/filter/table_filter_functions.hpp)。
+
+普通 optional 的 child 用于统计推导，行级语义为 TRUE。用于非密集 IN、一般同列 OR、宽松 temporal-cast 界以及部分 runtime min/max 等；精确谓词或 join 仍负责结果语义。root non-selectivity optional 在行组检查后被摘出行级过滤列表，见 `RowGroup::CheckZonemap`。
+
+选择率可选过滤不是永久停用：[table_filter_selectivity_optional_function.cpp](../src/planner/filter/table_filter_selectivity_optional_function.cpp) 的 `SelectivityStats::Update` 在观测后暂停低收益过滤，并按 `VECTOR_PAUSE=10` 与递增 `pause_multiplier` 重新激活采样。当前策略常量见 [GetThresholdAndVectorsToCheck](../src/planner/filter/table_filter_functions.cpp)：
+
+| 类型 | accepted / processed 达到此值则可暂停 | 观测 vector 数 |
+|---|---:|---:|
+| min/max | 0.9 | 6 |
+| Bloom | 0.5 | 6 |
+| prefix-range | 0.5 | 6 |
+
+命中率高表示过滤掉的行少。暂停只适用于正确性上可省略的候选裁剪，不能用来忽略已完全下推的普通 WHERE。
+
+## 五、TopN 的动态边界
+
+[TopN::CanOptimize](../src/optimizer/topn_optimizer.cpp) 要求常量 LIMIT、非表达式 OFFSET，并找到 ORDER BY（可穿过 projection）。存在基数估计时，仅当 `limit + offset > 5000` **且**超过 child cardinality 的0.7%，才因“大 limit”拒绝 TopN；旧“所有 limit 必须 <=0.7%”错误。
+
+`PushdownDynamicFilters` 还要求首排序键为 `BOUND_COLUMN_REF`，类型为 `TypeIsNumeric(InternalType)` 或 VARCHAR；不是“仅逻辑整数和 varchar”。目标扫描必须可到达，cast 重构路径、try-cast/错误语义和类型要满足进一步检查。
+
+```text
+LogicalTopN::dynamic_filter
+  → 共享 DynamicFilterData
+  → scan 内 optional(dynamic(sort_key))
+  ← TopNBoundaryValue::UpdateValue 收紧边界
 ```
 
-后两个 `*_OR_NULL` 用来处理 SQL 三值逻辑(3VL)—— `NULL` 在比较结果中等于 unknown。`FILTER_TRUE_OR_NULL` 的意思是「对于非 null 值这个 filter 一定通过,但 null 值需要单独判断」。
+[physical_top_n.cpp](../src/execution/operator/order/physical_top_n.cpp) 的 `TopNBoundaryValue::UpdateValue` 将 sort-key 边界解码后调用 `SetValue`。ASC 单排序键用 `<`、多键用 `<=`；DESC 对称，NULLS FIRST 额外保留 NULL。边界可帮助跳过未来统计不可能贡献更优结果的区域，是否收益大取决于数据顺序、分布、k/offset 和扫描速度。它不是每读一行都必定更新一次的 API 承诺。
 
-#### 5.1.1 3VL 边界的核心:ConstantFilter::CheckStatistics
+## 六、Join 的 min/max、IN、Bloom 与 prefix-range
 
-回顾 `constant_filter.cpp:37-79`:
+详细生命周期见 [RUNTIME_FILTER_DESIGN.md](./RUNTIME_FILTER_DESIGN.md)。关键条件在 [physical_hash_join.cpp](../src/execution/operator/join/physical_hash_join.cpp) 的 `CanUseInFilter`、`CanUseBloomFilter`、`CanUsePrefixRangeFilter`、`FinalizeFilters`：
 
-```cpp
-FilterPropagateResult ConstantFilter::CheckStatistics(BaseStatistics &stats) const {
-    if (!stats.CanHaveNoNull()) {
-        // no non-null values are possible: always false
-        return FilterPropagateResult::FILTER_ALWAYS_FALSE;
-    }
-    ...
-    result = NumericStats::CheckZonemap(stats, comparison_type, array_ptr<const Value>(&constant, 1));
-    ...
-    if (result == FilterPropagateResult::FILTER_ALWAYS_TRUE) {
-        // the numeric filter is always true, but the column can have NULL values
-        // we can't prune the filter
-        if (stats.CanHaveNull()) {
-            return FilterPropagateResult::NO_PRUNING_POSSIBLE;
-        }
-    }
-    return result;
-}
-```
+- min/max 小范围可以生成便宜比较；相等时生成精确单值比较。
+- 小 hash build 可尝试 optional IN；列表需要非 NULL、非密集，不能把 build 行数等同于 distinct key 数。
+- Bloom 还依赖唯一等值 key、build/probe 估计比例和完整构建后的发布条件，不是“build 大就必用 Bloom”。
+- 当前存在 prefix-range filter，并按 key 类型、值域跨度和位预算优先选择；外部 join 不从单轮 materialized 分区构造全局 PRF。
+- [BloomFilter::Seal](../src/planner/filter/table_filter_bloom_function.cpp) 可 fold 并释放多余内存；仅完整、sealed、仍有用的过滤器可发布。不能发布只覆盖某个 build 分区的候选集合。
 
-**这是新手最容易写错的地方**。直觉上 `[100, 200] > 50` 应该是 always-true,但如果列里有 NULL,这些 NULL 行的 `x > 50` 结果是 NULL(在 `WHERE` 中不通过),不能直接把 filter 标 always-true。所以 DuckDB 在 ALWAYS_TRUE + CanHaveNull 时**降级到 NO_PRUNING_POSSIBLE**,让 vector 级执行真的去逐行判断。
+Bloom/PRF 可减少候选行和部分区段扫描，同时有构建、hash/lookup 和内存成本。假阳性需要精确 join 继续判断；无假阴性才是预过滤正确性的前提。源码的目标假阳性模型不是本轮测量结果。
 
-#### 5.1.2 Conjunction 的传播
+## 七、FilterCombiner 与函数统计的间接收益
 
-OR / AND 各自的 `CheckStatistics`(见 [FILTER_DESIGN §2.2.3](./FILTER_DESIGN.md#223-conjunctionandfilter--conjunctionorfilter))定义了如何把子 filter 的结果合成。AND 任一 FALSE → 整 row group 跳过(`ALWAYS_FALSE`),这是 zone-map 剪枝的主要来源。OR 任一 TRUE → 整 row group 全过(`ALWAYS_TRUE`),意味着这一列对其它 OR 子句没贡献,但**其它列**的 filter 仍会决定是否继续。
+[FilterCombiner](../src/optimizer/filter_combiner.cpp) 合并等价类、消除冗余比较并检测矛盾，例如 `x > 5 AND x > 7` 可收紧为后者；能证明不可满足时可替换为 `LogicalEmptyResult`。在允许传播的 join 语义下，等值关系可把常量约束传给另一侧。outer/anti 的保留侧不能随意裁掉。
 
-#### 5.1.3 收益估算
+普通函数也有特定统计机会：[ContainsFilterPrune](../src/function/scalar/string/contains.cpp) 利用最大字符串长度和精确/截断 min/max；CAST 可依赖 [ExpressionFilter](../src/planner/filter/expression_filter.cpp) 的 cast 统计传播；temporal cast 的宽松界只部分下推并保留原条件。不能用通用“对 f 求逆”替换作等价优化，尤其要考虑溢出、精度、NULL、排序规则和抛错语义。
 
-ClickBench / TPC-H 这种「strong filter on a clustered column」(典型:lineitem 按 `l_shipdate` 排,WHERE 带 `l_shipdate BETWEEN ...`)上,**很大一部分 row group 的 stats 完全 disjoint**,可被直接整块跳过。一次 row group 通常 122880 行(`STANDARD_VECTOR_SIZE × ROW_GROUP_VECTOR_COUNT`),省 I/O 量级是 1+ MB。
+## 八、端到端示意
 
-非聚簇列(`l_quantity`、`l_returnflag`)的 in-range 谓词通常无法 zone-map 剪枝,**只能省 emit、不省 storage 读**。
-
-### 5.2 SelectionVector 模板化 + late materialization
-
-见 [FILTER_EXECUTION_DESIGN §4.4 / §4.5](./FILTER_EXECUTION_DESIGN.md#44-vector-级-filter-与-late-materialization)。核心收益:谓词命中率 1% 时,投影列只解压 1% 数据。
-
-具体到 TPC-H Q6(strong shipdate range + quantity range)这种 scan-dominated query,late-mat 与 zone-map 的组合可以让 scan 加速 10× 以上。
-
-详 [[LATE_MATERIALIZATION_DESIGN]]。
-
-### 5.3 DynamicFilter:执行期值注入(非 join 来源)
-
-DynamicFilter 的结构见 [FILTER_DESIGN §2.2.6](./FILTER_DESIGN.md#226-dynamicfilter--dynamicfilterdata)。这里重点讲 **TopN dynamic filter** —— `ORDER BY ... LIMIT k` 模式下的「自我加速」机制。
-
-#### 5.3.1 TopN 生成 DynamicFilter
-
-`TopN::PushdownDynamicFilters`(`src/optimizer/topn_optimizer.cpp:67-135`):
-
-```cpp
-void TopN::PushdownDynamicFilters(LogicalTopN &op) {
-    bool nulls_first = op.orders[0].null_order == OrderByNullType::NULLS_FIRST;
-    auto &type = op.orders[0].expression->return_type;
-    if (!TypeIsIntegral(type.InternalType()) && type.id() != LogicalTypeId::VARCHAR) {
-        // only supported for integral types currently
-        return;
-    }
-    if (op.orders[0].expression->GetExpressionType() != ExpressionType::BOUND_COLUMN_REF) {
-        // we can only pushdown on ORDER BY [col] currently
-        return;
-    }
-    if (op.dynamic_filter) return;
-    auto &colref = op.orders[0].expression->Cast<BoundColumnRefExpression>();
-    ...
-    // 找下游可消费 dynamic filter 的 scan
-    vector<PushdownFilterTarget> pushdown_targets;
-    JoinFilterPushdownOptimizer::GetPushdownFilterTargets(*op.children[0], std::move(columns), pushdown_targets);
-    if (pushdown_targets.empty()) return;
-
-    ExpressionType comparison_type;
-    if (op.orders[0].type == OrderType::ASCENDING) {
-        comparison_type =
-            op.orders.size() == 1 ? ExpressionType::COMPARE_LESSTHAN : ExpressionType::COMPARE_LESSTHANOREQUALTO;
-    } else {
-        comparison_type =
-            op.orders.size() == 1 ? ExpressionType::COMPARE_GREATERTHAN : ExpressionType::COMPARE_GREATERTHANOREQUALTO;
-    }
-    Value minimum_value = type.InternalType() == PhysicalType::VARCHAR ? Value("") : Value::MinimumValue(type);
-    auto base_filter = make_uniq<ConstantFilter>(comparison_type, std::move(minimum_value));
-    auto filter_data = make_shared_ptr<DynamicFilterData>();
-    filter_data->filter = std::move(base_filter);
-    op.dynamic_filter = filter_data;
-
-    for (auto &target : pushdown_targets) {
-        ...
-        auto dynamic_filter = make_uniq<DynamicFilter>(filter_data);
-        unique_ptr<TableFilter> pushed_filter = std::move(dynamic_filter);
-        if (nulls_first) {
-            auto or_filter = make_uniq<ConjunctionOrFilter>();
-            or_filter->child_filters.push_back(make_uniq<IsNullFilter>());
-            or_filter->child_filters.push_back(std::move(pushed_filter));
-            pushed_filter = std::move(or_filter);
-        }
-        auto optional_filter = make_uniq<OptionalFilter>(std::move(pushed_filter));
-        auto &column_index = get.GetColumnIds()[col_idx];
-        get.table_filters.PushFilter(column_index, std::move(optional_filter));
-    }
-}
-```
-
-要点:
-1. **限制**:`ORDER BY` 必须是单列且为 integral / varchar(`:71-77`)。其他类型(date、decimal、struct...)暂不支持。
-2. **`NULLS FIRST` 包 `ConjunctionOrFilter(IsNullFilter, DynamicFilter)`**(`:123-128`):排序时 NULL 在前的话,初始 top-K 可能全是 NULL,filter 必须放过 NULL 行。
-3. **外层包 `OptionalFilter`**(`:129`):一开始 `initialized=false`,`CheckStatistics` 返回 NO_PRUNING_POSSIBLE;**zone-map 收益要等执行期 boundary 收紧后才出现**。
-4. **生效条件**:TopN 优化器要 `CanOptimize` 判断 `LIMIT` 是常量且不超过 `0.7% × child_card`(`:50-54`),否则全排序更快。
-
-#### 5.3.2 TopNBoundaryValue::UpdateValue 与值更新
-
-`src/execution/operator/order/physical_top_n.cpp:63-75`:
-
-```cpp
-void UpdateValue(string_t boundary_val) {
-    unique_lock<mutex> l(lock);
-    if (!is_set || boundary_val < string_t(boundary_value)) {
-        boundary_value = boundary_val.GetString();
-        is_set = true;
-        if (op.dynamic_filter) {
-            CreateSortKeyHelpers::DecodeSortKey(boundary_val, boundary_vector, 0, boundary_modifiers);
-            auto new_dynamic_value = boundary_vector.GetValue(0);
-            l.unlock();
-            op.dynamic_filter->SetValue(std::move(new_dynamic_value));   // ← 把当前 top-K 边界写回 ConstantFilter
-        }
-    }
-}
-```
-
-TopN heap 每次进新元素都会 `EntryShouldBeAdded` 检查(`physical_top_n.cpp:139-149`),如果新值挤掉了 heap 顶,就调 `UpdateValue` 推进边界。scan 端的 ConstantFilter 一旦更新,后续 row group 立即享受到新的剪枝。
-
-#### 5.3.3 实际收益(ClickBench Q24 案例)
-
-ClickBench Q24 `SELECT * FROM hits ORDER BY EventTime LIMIT 10` 这类 query,DuckDB 跑 0.21s(emit 408 行),而**没有** TopN dynamic filter 的引擎可能跑 7.51s 以上(emit 100M 行),**35× 量级 gap**。**根本原因**:scan 在执行 ~1ms 后边界就收紧,后续 row group 几乎全被 zone-map 剪掉;否则 scan 必须把全表所有行都吐到 TopN 算子,白白浪费 I/O + 解压。
-
-### 5.4 OptionalFilter / SelectivityOptionalFilter:自适应跳过
-
-详见 [FILTER_DESIGN §2.2.7 / §2.2.8](./FILTER_DESIGN.md#227-optionalfilter)。这里只强调收益:
-
-- **OptionalFilter**:把 OR / 非密集 IN 从 hot loop 摘掉,**只享受 zone-map 收益**。RowGroup 跳过率高时,无需付出行级执行成本。`row_group.cpp:528-530` 是关键代码:OPTIONAL_FILTER 类型在 row group 级检查后无条件标 always-true,从而被排除出 vector 级 hot loop。
-- **SelectivityOptionalFilter**:实测前 N 个 vector 的选择率,>= 阈值后自动暂停。**自动避免「这个 filter 帮不上忙反而费 CPU」的退化场景**。
-
-阈值常量(`selectivity_optional_filter.cpp:18-22`)分两组:
-- `MIN_MAX_THRESHOLD` + `MIN_MAX_CHECK_N`:min/max 形态(包 ConstantFilter)用;
-- `BF_THRESHOLD` + `BF_CHECK_N`:Bloom filter 形态(包 BFTableFilter)用。
-
-源码 TODO(`:62-63`)指出 per-row-group thread-local pause 还没做。
-
-### 5.5 BloomFilter(静态 + 动态形态)
-
-`BFTableFilter` 的 stats × BF 联合裁剪(详见 [FILTER_DESIGN §2.2.9](./FILTER_DESIGN.md#229-bftablefilterbloom-filter-形态))是 DuckDB 静态阶段对 Bloom 的主要用途:用 stats min/max 把搜索域缩到 ≤2048 整数值后逐值打 BF,全不命中 → 整 row group 跳过,全命中 → BF 没用、行级跳过 BF。
-
-**动态阶段**(join build 后):由 `JoinFilterPushdownInfo::FinalizeFilters` 构造 `SelectivityOptionalFilter<BFTableFilter>` 下推。详 [[RUNTIME_FILTER_DESIGN §10]]。
-
-### 5.6 FilterCombiner 传递性推理的扫描端收益
-
-详见 [FILTER_PUSHDOWN_DESIGN §3.6](./FILTER_PUSHDOWN_DESIGN.md#36-filtercombiner-三大推理)。这里补一点对扫描端的间接收益:`a = b AND b > 100` 在 join 上游推出 `a > 100` 后,**也能下推到 a 所在 scan** —— 给 build / probe 两侧都加 zone-map 机会,从而把 join 上游的 row group 剪枝率显著提高。
-
-### 5.7 ExpressionFilter 兜底的代价与启示
-
-`expression_filter.cpp:29-37` 明确返回 `NO_PRUNING_POSSIBLE`(geometry 例外),所以:
-
-- **无 zone-map 收益**:整 row group 必读;
-- **无 SIMD 模板化**:走 ExpressionExecutor 解释执行;
-- **不能合并**:多个 ExpressionFilter 各跑各的。
-
-但相比 LogicalFilter:
-- **省去 chunk 出 scan 后再过滤的算子调度开销**;
-- **late materialization 仍适用**:命中行才物化其它列;
-- **可与其它 TableFilter 共享 SelectionVector** 流式收窄。
-
-**表达式简化的价值**:如果能把 `CAST(x AS DATE) > '1996-01-01'` 简化为 `x > '1996-01-01'::TIMESTAMP`,就能从 ExpressionFilter 退化为 ConstantFilter,**直接拿到 zone-map**。值得在 optimizer 里多做这类:
-
-| 模式 | 原 ExpressionFilter | 简化后 |
-|---|---|---|
-| `CAST(x AS T) op c` | yes | `x op cast_back(c)`,如果可逆 |
-| `f(x) op c`(f 单调) | yes | `x op f⁻¹(c)` |
-| `x + k op c`(k 常量) | yes | `x op c-k` |
-| `lower(x) = 'abc'` | yes | `x IN ('abc', 'Abc', 'ABc', …)` 当 cardinality 小 |
-
-DuckDB 的 `FilterCombiner` / `expression_rewriter` 中已实现部分。
-
----
-
-## §6 端到端例子
-
-来追一条 TPC-H 风格的 SQL:
+以下 SQL 仅作路径说明，未执行，不给出臆测 EXPLAIN、行数或耗时：
 
 ```sql
 SELECT l_orderkey, SUM(l_extendedprice * (1 - l_discount))
@@ -220,85 +97,6 @@ WHERE l_shipdate BETWEEN DATE '1996-01-01' AND DATE '1996-12-31'
 GROUP BY l_orderkey;
 ```
 
-### 6.1 Optimizer 阶段
+可能的机制是日期/数量比较成为 `ExpressionFilter`，非密集 IN 部分下推 optional 并保留精确 IN；LIKE 若被改为 contains，内置表可接受通用单列表达式下推，并有 contains 自身统计 callback。实际剩余 FILTER 还受 IN rewrite、表达式优化、数据源能力和统计影响，不能同时声称 LIKE 已完全下推又画一个负责同一精确条件的必然残留 FILTER。
 
-`LogicalFilter::SplitPredicates` 把 AND 展平成 4 个谓词,逐个 `combiner.AddFilter`:
-
-| 谓词 | combiner 处理 | 结果 |
-|---|---|---|
-| `l_shipdate BETWEEN ... AND ...` | `AddFilter` 走 BoundBetween 分支,拆 2×`ConstantFilter`,各自 push 到 `l_shipdate` | TableFilterSet[l_shipdate] = ConjunctionAndFilter{>=1996-01-01, <=1996-12-31}(由 PushFilter 自动 AND) |
-| `l_quantity > 24` | BoundComparison → ConstantFilter | TableFilterSet[l_quantity] = ConstantFilter(>,24) |
-| `l_returnflag IN ('A','R')` | TryPushdownInFilter:string 不走密集 path,落到非密集分支 → InFilter + OptionalFilter | TableFilterSet[l_returnflag] = OptionalFilter(InFilter(['A','R'])) |
-| `l_comment LIKE '%urgent%'` | 非前缀 LIKE,combiner 返回 UNSUPPORTED;`PushdownGet` 最后阶段 `TryPushdownGenericExpression` 包 ExpressionFilter | TableFilterSet[l_comment] = ExpressionFilter(l_comment LIKE '%urgent%') |
-
-最终 `LogicalGet::table_filters`:
-
-```
-TableFilterSet {
-    l_shipdate:    ConjunctionAndFilter {
-                       ConstantFilter(>= 1996-01-01),
-                       ConstantFilter(<= 1996-12-31)
-                   },
-    l_quantity:    ConstantFilter(> 24),
-    l_returnflag:  OptionalFilter { InFilter(['A','R']) },
-    l_comment:     ExpressionFilter("l_comment LIKE '%urgent%'")
-}
-```
-
-### 6.2 Row group 级 zone-map
-
-假设 lineitem 物理按 `l_shipdate` 聚簇(TPC-H dbgen 默认顺序),100M 行分成 ~800 个 row group。
-
-| 列 | filter | CheckStatistics 结果 |
-|---|---|---|
-| `l_shipdate` | ConjunctionAndFilter | row group min/max 命中 1996 区间外的:`ALWAYS_FALSE` → **整 row group 跳过**;命中区间内:`ALWAYS_TRUE`(整段都在 1996);跨边界:`NO_PRUNING_POSSIBLE` |
-| `l_quantity` | ConstantFilter(>24) | row group min/max 大多数命中 [1,50]:`NO_PRUNING_POSSIBLE`;极少数全 <= 24 的段:`ALWAYS_FALSE` |
-| `l_returnflag` | OptionalFilter | 类型为 OPTIONAL → **无论 prune_result 都 SetFilterAlwaysTrue**,后续 vector 级别不再执行;但 stats 命中 'A','R' 之外的整段会被 `ALWAYS_FALSE` 跳过(InFilter 在 zone-map 阶段还是会查) |
-| `l_comment` | ExpressionFilter | `NO_PRUNING_POSSIBLE`(无 geometry stats) |
-
-**总体效果**:大部分 row group 被 `l_shipdate` 剪掉,余下 ~70(年份命中)进入 vector 级。
-
-### 6.3 Vector 级 partial scan
-
-留下的 row group 进入 `RowGroup::Scan`:
-
-1. **filter 列先扫**:`l_shipdate` / `l_quantity` / `l_returnflag` / `l_comment` 都有 filter。
-   - `l_returnflag` 的 filter 是 OPTIONAL,被标 always-true,**不会进入 vector hot loop**;
-   - 实际逐 vector 跑的是 `l_shipdate`(ConjunctionAndFilter → 两个 ConstantFilter)、`l_quantity`(ConstantFilter)、`l_comment`(ExpressionFilter)。
-2. **AdaptiveFilter 排序**:经过若干 vector 观察后,permutation 可能演变为 `[l_quantity, l_shipdate, l_comment]`(假设 `l_quantity > 24` 选择率最低、`l_comment LIKE` 最贵留到最后)。
-3. **SelectionVector 流式收窄**:每个 filter 把 `approved_tuple_count` 减少。
-4. **Slice + late materialization**:filter 列按最终 sel `Slice` 一次;`l_orderkey`、`l_extendedprice`、`l_discount` 只为命中行 `Select` 物化。
-5. **HASH GROUP BY 上游消费**:scan 输出的 chunk 只含命中行,直接进入 `PhysicalHashGroupBy`。
-
-### 6.4 EXPLAIN ANALYZE 期望节选
-
-```
-┌─────────────────────────────────────────┐
-│            HASH_GROUP_BY                │
-│   --------------------                  │
-│   Groups: #0                            │
-└──────────────┬──────────────────────────┘
-┌──────────────┴──────────────────────────┐
-│              PROJECTION                 │
-│   --------------------                  │
-│   l_orderkey                            │
-│   l_extendedprice * (1 - l_discount)    │
-└──────────────┬──────────────────────────┘
-┌──────────────┴──────────────────────────┐
-│               FILTER                    │
-│   --------------------                  │
-│   l_comment LIKE '%urgent%'             │  ← LIKE 还留在 LogicalFilter 上游
-└──────────────┬──────────────────────────┘
-┌──────────────┴──────────────────────────┐
-│             TABLE_SCAN                  │
-│   --------------------                  │
-│   Table: lineitem                       │
-│   Filters:                              │
-│     l_shipdate >= 1996-01-01 AND        │
-│     l_shipdate <= 1996-12-31            │
-│     l_quantity > 24                     │
-│     optional: l_returnflag IN ('A','R') │
-└─────────────────────────────────────────┘
-```
-
-实际生产的 `EXPLAIN ANALYZE` 还会带 row 数、时间等。这里只示意 `Filters:` 节点的格式。
+行组阶段能证明不匹配才跳；扫描阶段 active 谓词缩小选择集，其余列按 codec/updates 条件延后读取。要给出性能结论，还需冻结数据、排序布局、配置、构建、冷热缓存和 profiling 指标；本轮没有开展这些实验。

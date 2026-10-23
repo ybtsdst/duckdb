@@ -1,511 +1,102 @@
-# DuckDB Filter Execution 设计文档(扫描期执行)
+# DuckDB Filter Execution 设计文档（扫描期执行）
 
-> 本文是 `FILTER_DESIGN.md` 系列的第 3 篇,专注**扫描期**:`PhysicalTableScan` 接到 `TableFilterSet` 后,storage 层是怎么用三层 zone-map(row group / segment / vector)做剪枝、怎么把 SelectionVector 流式收窄实现 late materialization、`ColumnSegment::FilterSelection` 怎么走模板化 fast path、`AdaptiveFilter` 怎么按观测选择率重排。
->
-> 类层次见 [FILTER_DESIGN.md](./FILTER_DESIGN.md);规划期转换见 [FILTER_PUSHDOWN_DESIGN.md](./FILTER_PUSHDOWN_DESIGN.md);性能机制深入见 [FILTER_PERFORMANCE_DESIGN.md](./FILTER_PERFORMANCE_DESIGN.md)。
+> 适用源码：`v2.0-cyanoptera` @ `c1cd2470a455`；核对日期：2026-10-23。核对方式：静态源码审查，未执行本文示例或性能测试。
 
-## §4 执行流程:scan 怎么用 filter
+## 范围
 
-### 4.1 PhysicalTableScan 入口
+本文是 [Filter 系列](./FILTER_DESIGN.md) 的扫描期部分。讨论 DuckDB 内置存储从 `ExpressionFilter` 集合到统计剪枝、SelectionVector 和列读取的路径。外部 Table Function 的过滤由各自实现负责，`PhysicalTableScan` 不会对任意数据源输出自动补过滤。
 
-`src/execution/operator/scan/physical_table_scan.cpp:159` `PhysicalTableScan::GetDataInternal`,它把 `global_state.global_state` 传给 `function.function(...)`(table function 的实现)。filter 是在 `TableScanGlobalSourceState` 构造期合并的:
+## 一、扫描初始化与过滤器寿命
 
-```cpp
-// physical_table_scan.cpp:32-37
-TableScanGlobalSourceState(ClientContext &context, const PhysicalTableScan &op) {
-    ...
-    if (op.dynamic_filters && op.dynamic_filters->HasFilters()) {
-        table_filters = op.dynamic_filters->GetFinalTableFilters(op, op.table_filters.get());
-    }
-    ...
-    auto filters = table_filters ? *table_filters : GetTableFilters(op);
-    TableFunctionInitInput input(op.bind_data.get(), op.column_ids, op.projection_ids, filters,
-                                 op.extra_info.sample_options, &op);
-    global_state = op.function.init_global(context, input);
-}
+[physical_table_scan.cpp](../src/execution/operator/scan/physical_table_scan.cpp) 的 `TableScanGlobalSourceState` 在初始化时调用 `DynamicTableFilterSet::GetFinalTableFilters`，将生产者发布的运行期集合和静态 `op.table_filters` 合并，通过 `TableFunctionInitInput::filters` 交给 `init_global`；`TableScanLocalSourceState` 把同一个最终集合交给 `init_local`。
+
+合并集合保存在 global source state，字段析构顺序使其寿命覆盖引用它的 table-function global state。集合合并是初始化时的动作，不是每个输出 chunk 重新合并；但表达式 bind data 中的共享 `DynamicFilterData` 后续仍可更新，这是 TopN 的路径。
+
+[scan_state.cpp](../src/storage/table/scan_state.cpp) 的 `ScanFilterInfo::Initialize` 为每个单列 filter 构造 `ScanFilter`、`TableFilterState` 和可重排列表，保存 `ProjectionIndex → StorageIndex` 对应关系。多列 filters 单独保存用于 row-group 统计，不进入单列 hot loop。
+
+## 二、Row group 统计剪枝
+
+依据：[row_group.cpp](../src/storage/table/row_group.cpp) 的 `RowGroup::CheckZonemap`。
+
+1. 对多列 `ExpressionFilter` 按 `column_indexes` 收集该行组各列统计，调用 `CheckExpressionStatistics`。统计不支持或缺失时继续保守扫描；FALSE / FALSE_OR_NULL 则跳过行组。
+2. `CheckAllFilters()` 重置上一个行组留下的 always-true 状态。
+3. 对单列过滤调用该列的 `CheckZonemap`；rowid 没有持久 zone-map，由 `CheckRowIdFilter` 构造 `[row_start, row_start + count - 1]` 的数值统计。
+4. FALSE / FALSE_OR_NULL 跳过行组；root non-selectivity optional 在未排除行组时标记为 always-true；精确 ALWAYS_TRUE 也省略行级判断。
+5. TRUE_OR_NULL / NO_PRUNING 不能直接放行所有行。
+
+这里跳过的是后续行数据扫描工作。统计/元数据读取、缓存命中和已提交的预取都可能已发生，不能概括为“绝对零 I/O”。
+
+`SetFilterAlwaysTrue` 同时清该列的 active-filter 标记，所以只用于统计的列若仍在扫描请求内，会在普通列读取阶段被正确填充，不会产生未初始化输出。
+
+## 三、Segment 统计与扫描准备
+
+`RowGroup::CheckZonemapSegments` 使用列当前 segment 的统计，能排除时推进完整 vector 的扫描位置；不足一个 vector 的可跳区间仍有保守处理。段边界由压缩和存储布局决定，不能假设每段大小固定为 vector 大小的整数倍。
+
+当前实现将准备和消费拆开：`PrepareScan` 选择可扫描的 vector，`ProcessPreparedScan` 消费准备好的状态，`Scan` 串接二者。内置表函数还使用 `PrepareScanIO` / `ProcessPreparedScan`、`ScanReadAhead` 调度读取，见 [table_scan.cpp](../src/function/table/table_scan.cpp)。因此实际调用可能跨异步任务，旧“GetData 内立即同步读完一批”的图不能覆盖全部路径。
+
+MVCC 可见性、删除、采样选择和过滤选择共同决定最终行集合；不能只依据 WHERE 命中率解释输出行数。
+
+## 四、向量内先过滤再读取其余列
+
+下面是对 `RowGroup::ProcessPreparedScan` 的简化伪代码，省略事务、采样、错误及异步控制：
+
+```text
+sel = 当前可见/采样行
+if 无 active filter 且不需部分可见性处理:
+    扫描请求中的所有列
+else:
+    按 AdaptiveFilter 顺序处理 active filter 列:
+        若已无存活行，仅推进该列 scan state
+        否则 ColumnData::Filter(..., sel, approved_count)
+    对已读取 filter 列按最终 sel Slice
+    若 approved_count == 0:
+        其余列 Skip，完成本 vector
+    否则:
+        对其余列 ColumnData::Select(..., sel, approved_count)
 ```
 
-`table_filters` 字段(`:71`)保存合并后的最终 set,`GetTableFilters(op)`(`:73`)若动态 set 为空就用 base set。**只在 scan 全局初始化时合并一次** —— dynamic filter 后续的 `SetValue()` 通过 `shared_ptr<DynamicFilterData>` 在 storage 层看到。
+关键收益是选择集合可流式收窄；已经排除整个 vector 时，无需再扫描其余列的数据。`Slice` 经常是引用/选择映射操作，不能将其描述成“一次拷贝全部物理数据”。
 
-对内置表(`DataTable`):table function 的 init/scan 实现在 `src/storage/data_table.cpp` + `RowGroupCollection::InitializeScan`。filter 通过 `ScanFilterInfo` 暴露给 `RowGroup::Scan`。
+### Select 不保证只解码存活行
 
-### 4.2 Row group 级 zone-map 剪枝
+必须区分两个实现，依据 [column_data.cpp](../src/storage/table/column_data.cpp) 与 [standard_column_data.cpp](../src/storage/table/standard_column_data.cpp)：
 
-`src/storage/table/row_group.cpp:515-538` `RowGroup::CheckZonemap`:
+- `ColumnData::Select` 的基础实现是 `Scan` 然后 `Slice`，可能仍扫描整个 vector。
+- `StandardColumnData::Select` 仅当数据与 validity 压缩函数都提供 `select`、且二者没有 updates 时走 `SelectVector`；否则回退基础实现。
+- `ColumnData::SelectVector` 按 segment 分配所选行，调用 [ColumnSegment::Select](../src/storage/table/column_segment.cpp) 的压缩回调。没有选中行的段可以跳过，但具体解码粒度由压缩实现决定。
 
-```cpp
-bool RowGroup::CheckZonemap(ScanFilterInfo &filters) {
-    auto &filter_list = filters.GetFilterList();
-    // new row group - label all filters as up for grabs again
-    filters.CheckAllFilters();
-    for (idx_t i = 0; i < filter_list.size(); i++) {
-        auto &entry = filter_list[i];
-        auto &filter = entry.filter;
-        const auto &base_column_index = entry.table_column_index;
+所以“1% 命中率意味着只读取/解压 1% 投影数据”不是通用结论。这种扫描内延后读取也不同于 [LateMaterialization 优化器](./LATE_MATERIALIZATION_DESIGN.md) 的行 ID 半连接改写。
 
-        auto prune_result = GetColumn(base_column_index).CheckZonemap(base_column_index, filter);
-        if (prune_result == FilterPropagateResult::FILTER_ALWAYS_FALSE) {
-            return false;          // ← 整 row group 跳过
-        }
-        if (filter.filter_type == TableFilterType::OPTIONAL_FILTER) {
-            // these are only for row group checking, set as always true so we don't check it
-            filters.SetFilterAlwaysTrue(i);
-        } else if (prune_result == FilterPropagateResult::FILTER_ALWAYS_TRUE) {
-            // filter is always true - no need to check it
-            filters.SetFilterAlwaysTrue(i);
-        }
-    }
-    return true;
-}
+## 五、ExpressionFilter 行级执行
+
+入口为 [ColumnSegment::FilterSelection](../src/storage/table/column_segment.cpp)，当前不再按一组活动 `TableFilterType` 子类 switch。它取 `ExpressionFilterState`：
+
+```text
+存在 fast_executor 且 scan_count <= STANDARD_VECTOR_SIZE
+  → fast_executor->FilterSelection
+否则
+  → ExecuteExpressionFilterSelection
+  → ExpressionExecutor::SelectExpression
 ```
 
-这 24 行包含整个 row group 级剪枝的全部设计:
+[table_filter_state.cpp](../src/planner/table_filter_state.cpp) 的 `TryCreateFastExecutor` 按表达式形状构建快速执行器，包括简单列常量比较、可完整识别的 AND、optional、Bloom、prefix-range 等。AND 的子树只要有一部分不支持，整体会回退通用 executor。NULL 检查或复杂 CAST 不应仅因旧版存在专门枚举就假定能命中快速路径。
 
-1. **`CheckAllFilters()`**(`:518`):每进一个新 row group,重置「always-true」标记。因为上个 row group 的 stats 可能命中 always-true,但下个 row group 不一定。
-2. **`prune_result == FILTER_ALWAYS_FALSE`**(`:525-527`):返回 `false`,整 row group 跳过 —— **根本不读 I/O**。
-3. **`OPTIONAL_FILTER` 类型特判**(`:528-530`):无论 `prune_result` 如何,标 always-true。后续 vector 级扫描跳过这个 filter,对应 [FILTER_DESIGN §2.2.7](./FILTER_DESIGN.md#227-optionalfilter) 的设计意图。
-4. **`prune_result == FILTER_ALWAYS_TRUE`**(`:531-535`):同样标 always-true,vector 级别不再 evaluate。
-5. **`NO_PRUNING_POSSIBLE`**(隐式):保持原状,下一阶段的 segment 级或 vector 级仍要执行。
+`ComparisonFilterExecutor::TemplatedSelect<T, OP, CAN_HAVE_NULL>` 保留类型/比较/NULL 特化；`ExpressionFilterExecutor` 本身仍有虚接口，外围还有表达式分析和分派，不能声称全链路“零动态 dispatch”。是否机器级 SIMD 未在本次静态审查中验证。
 
-### 4.3 Segment 级 zone-map 推进
+通用执行把单列向量作为输入，传入已有选择向量，只判断仍存活的行；超过标准 vector 大小则分块处理并转换选择偏移。不要把单列表达式的 `BoundReference(0)` 和原表列0混淆。
 
-`row_group.cpp:540-594` `RowGroup::CheckZonemapSegments`:
+## 六、AdaptiveFilter：基于耗时试探顺序
 
-```cpp
-bool RowGroup::CheckZonemapSegments(CollectionScanState &state) {
-    auto &filters = state.GetFilterInfo();
-    optional_idx target_vector_index_max;
-    for (auto &entry : filters.GetFilterList()) {
-        if (entry.IsAlwaysTrue()) continue;
-        auto column_idx = entry.scan_column_index;
-        auto base_column_idx = entry.table_column_index;
-        auto &filter = entry.filter;
+依据：[adaptive_filter.cpp](../src/execution/adaptive_filter.cpp) 的构造、`BeginFilter`、`EndFilter`、`AdaptRuntimeStatistics`。
 
-        auto prune_result = GetColumn(base_column_idx).CheckZonemap(state.column_scans[column_idx], filter);
-        if (prune_result != FilterPropagateResult::FILTER_ALWAYS_FALSE) continue;
+扫描的初始 permutation 由 `ExpressionHeuristics::GetInitialOrder` 给出；后续比较整个过滤阶段的运行耗时，随机试探相邻交换。当前常量是 warmup 5 次、执行间隔20次、观察间隔10次。交换后的平均耗时未下降则撤销，并降低该位置再交换的概率。
 
-        // 找到能跳过的目标 vector 边界
-        auto &column_scan_state = state.column_scans[column_idx];
-        auto current_segment = column_scan_state.current;
-        if (!current_segment) continue;
-        auto row_start = current_segment->GetRowStart();
-        idx_t target_row = row_start + current_segment->GetNode().count;
-        if (target_row >= state.max_row) target_row = state.max_row;
-        D_ASSERT(target_row >= row_start);
-        D_ASSERT(target_row <= row_start + this->count);
-        idx_t target_vector_index = (target_row - row_start) / STANDARD_VECTOR_SIZE;
+这是耗时驱动的启发式，不是直接按单列观测选择率排序，也没有保证收敛到全局最优顺序。只有至少两个 filter 且允许重排时才执行学习；`CanThrow()` 或表达式 barrier 会禁用 permutation，以免改变抛错和求值顺序语义。
 
-        if (!target_vector_index_max.IsValid() || target_vector_index_max.GetIndex() < target_vector_index) {
-            target_vector_index_max = target_vector_index;
-        }
-    }
-    if (target_vector_index_max.IsValid()) {
-        if (state.vector_index == target_vector_index_max.GetIndex()) {
-            // we can't skip any full vectors because this segment contains less than a full vector
-            // for now we just bail-out
-            // FIXME: we could check if we can ALSO skip the next segments, in which case skipping a full vector
-            // might be possible
-            return true;
-        }
-        while (state.vector_index < target_vector_index_max.GetIndex()) {
-            NextVector(state);
-        }
-        return false;
-    }
-    return true;
-}
-```
+`AdaptiveFilter::Remap` 可按稳定 filter identity 重映射已有顺序；本次未穷尽多文件调用方的所有重映射和日志分支。
 
-每个 row group 内部有多个 `ColumnSegment`(压缩单元,默认 STANDARD_VECTOR_SIZE × N 大小)。segment 级 zone-map 比 row group 更细一档。
+## 七、执行检查要点
 
-注释里保留了 DuckDB 作者的 FIXME(`:581-583`):「当前 segment 不足一个 vector 时无法跳过,因为还不会合并多个 segment 的跳过」 —— 但「< 一个 vector 的段极少」所以实际影响有限。这是真实生产代码里能学到的一手观察。
+排查过滤效果时，先区分：过滤是否下推、统计是否能证明排除、行级是否 active、是否命中 fast executor、其余列是否能走选择性解码。这些层次不能通过一个 `Filters:` 展示字段统一推断。
 
-### 4.4 Vector 级 filter 与 late materialization
-
-`row_group.cpp:596-720` `RowGroup::Scan`,这是 storage 端最核心的一段。
-
-#### 4.4.1 Fast path:无 filter 且无删除
-
-```cpp
-// row_group.cpp:639-647
-bool has_filters = filter_info.HasFilters();
-if (count == max_count && !has_filters) {
-    // scan all vectors completely: full scan without deletions or table filters
-    for (idx_t i = 0; i < column_ids.size(); i++) {
-        const auto &column = column_ids[i];
-        auto &col_data = GetColumn(column);
-        state.column_scans[i].update_scan_type = options.update_type;
-        col_data.Scan(transaction, state.vector_index, state.column_scans[i], result.data[i]);
-    }
-}
-```
-
-满速直读,没有 SelectionVector 物化开销。这是「`SELECT *` 全表 + 无 WHERE」的极速路径。
-
-#### 4.4.2 Partial path:有 filter / 有删除
-
-```cpp
-// row_group.cpp:648-719
-else {
-    // partial scan: we have deletions or table filters
-    idx_t approved_tuple_count = count;
-    SelectionVector sel;
-    if (count != max_count) {
-        sel.Initialize(state.valid_sel);   // 含删除信息
-    } else {
-        sel.Initialize(nullptr);
-    }
-    //! first, we scan the columns with filters, fetch their data and generate a selection vector.
-    auto adaptive_filter = filter_info.GetAdaptiveFilter();
-    auto filter_state = filter_info.BeginFilter();
-    if (has_filters) {
-        auto &filter_list = filter_info.GetFilterList();
-        for (idx_t i = 0; i < filter_list.size(); i++) {
-            auto filter_idx = adaptive_filter->permutation[i];     // ← AdaptiveFilter 排序
-            auto &filter = filter_list[filter_idx];
-            if (filter.IsAlwaysTrue()) continue;
-            auto &table_filter_state = *filter.filter_state;
-
-            const auto scan_idx = filter.scan_column_index;
-            const auto column_idx = filter.table_column_index;
-
-            auto &result_vector = result.data[scan_idx];
-            if (approved_tuple_count == 0) {
-                auto &col_data = GetColumn(column_idx);
-                col_data.Skip(state.column_scans[scan_idx]);       // 没人活下来,只推进 offset
-                continue;
-            }
-            auto &col_data = GetColumn(column_idx);
-            col_data.Filter(transaction, state.vector_index, state.column_scans[scan_idx], result_vector, sel,
-                            approved_tuple_count, filter.filter, table_filter_state);
-        }
-        for (auto &table_filter : filter_list) {
-            if (table_filter.IsAlwaysTrue()) continue;
-            result.data[table_filter.scan_column_index].Slice(sel, approved_tuple_count);   // ← 一次性按 sel 物化
-        }
-    }
-    if (approved_tuple_count == 0) {
-        // all rows were filtered out
-        result.Reset();
-        for (idx_t i = 0; i < column_ids.size(); i++) {
-            auto &col_idx = column_ids[i];
-            if (has_filters && filter_info.ColumnHasFilters(i)) continue;
-            auto &col_data = GetColumn(col_idx);
-            col_data.Skip(state.column_scans[i]);                  // 把非 filter 列的 offset 也推过去
-        }
-        state.vector_index++;
-        continue;
-    }
-    //! Now we use the selection vector to fetch data for the other columns.
-    for (idx_t i = 0; i < column_ids.size(); i++) {
-        if (has_filters && filter_info.ColumnHasFilters(i)) continue;
-        auto &column = column_ids[i];
-        auto &col_data = GetColumn(column);
-        state.column_scans[i].update_scan_type = options.update_type;
-        col_data.Select(transaction, state.vector_index, state.column_scans[i], result.data[i], sel,
-                        approved_tuple_count);                     // ← 仅为存活行 Select
-    }
-}
-```
-
-#### 4.4.3 关键观察
-
-这段代码体现了三条性能哲学:
-
-1. **filter 列先扫**(`:663-684`):每个有 filter 的列调 `ColumnData::Filter`,sel 与 `approved_tuple_count` 流式收窄。早期收窄越好,后面 I/O / 解压越少。
-2. **Slice 一次性物化**(`:685-690`):全部 filter 跑完后,把 filter 列按最终 sel 一次 `Slice`(不是逐 filter Slice)。**这点重要**:连续多个 filter 时,中间不必反复物化向量,只在最后一次性切片。
-3. **late materialization**(`:692-719`):
-   - 如果 `approved_tuple_count == 0` → 整 vector 跳过(`continue`),非 filter 列只调 `Skip()` 推进 offset,**不读 I/O**;
-   - 否则非 filter 列调 `Select(...)`(`:717`),**仅为存活行解压**,而不是 `Scan()` 全部解压再过滤。
-
-> 「先 filter 后取列」是 DuckDB 把 ClickBench/TPC-H 跑到极致的根本机制:不命中谓词的行,投影列连解压都不做。
-
-详细对比 [[LATE_MATERIALIZATION_DESIGN]]。
-
-### 4.5 `ColumnSegment::Filter` / `FilterSelection` 模板化
-
-`src/storage/table/column_segment.cpp:405` `ColumnSegment::FilterSelection`,按 `filter.filter_type` 分发:
-
-```cpp
-idx_t ColumnSegment::FilterSelection(SelectionVector &sel, Vector &vector, UnifiedVectorFormat &vdata,
-                                     const TableFilter &filter, TableFilterState &filter_state,
-                                     idx_t scan_count, idx_t &approved_tuple_count) {
-    switch (filter.filter_type) {
-    case TableFilterType::OPTIONAL_FILTER: {
-        auto &opt_filter = filter.Cast<OptionalFilter>();
-        return opt_filter.FilterSelection(sel, vector, vdata, filter_state, scan_count, approved_tuple_count);
-    }
-    case TableFilterType::CONJUNCTION_OR: { ... }
-    case TableFilterType::CONJUNCTION_AND: {
-        auto &conjunction_and = filter.Cast<ConjunctionAndFilter>();
-        auto &state = filter_state.Cast<ConjunctionAndFilterState>();
-        for (idx_t child_idx = 0; child_idx < conjunction_and.child_filters.size(); child_idx++) {
-            auto &child_filter = *conjunction_and.child_filters[child_idx];
-            FilterSelection(sel, vector, vdata, child_filter, *state.child_states[child_idx], scan_count,
-                            approved_tuple_count);
-        }
-        return approved_tuple_count;
-    }
-    case TableFilterType::CONSTANT_COMPARISON: {
-        auto &constant_filter = filter.Cast<ConstantFilter>();
-        switch (vector.GetType().InternalType()) {
-        case PhysicalType::UINT8: {
-            auto predicate = UTinyIntValue::Get(constant_filter.constant);
-            FilterSelectionSwitch<uint8_t>(vdata, predicate, sel, approved_tuple_count,
-                                           constant_filter.comparison_type);
-            break;
-        }
-        case PhysicalType::INT32: { ... }
-        ...
-        }
-    }
-    case TableFilterType::IS_NULL: { ... }
-    case TableFilterType::IS_NOT_NULL: { ... }
-    case TableFilterType::DYNAMIC_FILTER: { ... 转发到内层 ConstantFilter ... }
-    ...
-    }
-}
-```
-
-ConjunctionOr 的处理(`:413-444`)略复杂:对每个子 filter 用临时 sel 跑一遍,把命中的 idx 用朴素 O(N²) 去重合并到结果 sel,**简单但能用** —— OR 通常在 hot path 已被 OptionalFilter 包,这里执行不算高频。
-
-#### 4.5.1 `TemplatedFilterSelection<T, OP, HAS_NULL>`(SIMD 友好 hot loop)
-
-`column_segment.cpp:288-303`:
-
-```cpp
-template <class T, class OP, bool HAS_NULL>
-static idx_t TemplatedFilterSelection(UnifiedVectorFormat &vdata, T predicate, SelectionVector &sel,
-                                      idx_t approved_tuple_count, SelectionVector &result_sel) {
-    auto &mask = vdata.validity;
-    auto vec = UnifiedVectorFormat::GetData<T>(vdata);
-    idx_t result_count = 0;
-    for (idx_t i = 0; i < approved_tuple_count; i++) {
-        auto idx = sel.get_index(i);
-        auto vector_idx = vdata.sel->get_index(idx);
-        bool comparison_result =
-            (!HAS_NULL || mask.RowIsValid(vector_idx)) && OP::Operation(vec[vector_idx], predicate);
-        result_sel.set_index(result_count, idx);
-        result_count += comparison_result;
-    }
-    return result_count;
-}
-```
-
-要点:
-- **没有虚函数**:`OP` 是 `Equals` / `LessThan` / `GreaterThan` 这类 trivial functor,编译期单态化;
-- **`HAS_NULL` 模板参数**:`mask.AllValid()` 时 dispatch 到 `HAS_NULL=false` 分支,内层 `mask.RowIsValid()` 完全消失;
-- **`result_count += comparison_result`**:branchless 写法,编译器能 vectorize。
-
-`FilterSelectionSwitch<T>`(`:305-376`)按 `comparison_type` × `HAS_NULL` 展开 6×2 = 12 个特化:
-
-```cpp
-case ExpressionType::COMPARE_LESSTHAN: {
-    if (mask.AllValid()) {
-        approved_tuple_count =
-            TemplatedFilterSelection<T, LessThan, false>(vdata, predicate, sel, approved_tuple_count, new_sel);
-    } else {
-        approved_tuple_count =
-            TemplatedFilterSelection<T, LessThan, true>(vdata, predicate, sel, approved_tuple_count, new_sel);
-    }
-    break;
-}
-```
-
-再算上外层 `physical_type`(uint8/uint16/uint32/uint64/int8/int16/int32/int64/float/double/decimal128 等),整套 `ConstantFilter` 行级执行**全程没有动态 dispatch**,这就是 DuckDB 在 ClickBench / TPC-H 跑到 GB/s scan 吞吐的根本。
-
-DuckDB 不依赖 LLVM JIT,完全靠 C++ 模板。代价是**二进制大**(每个 type × OP × HAS_NULL 组合都生成代码),但运行时零开销。
-
-#### 4.5.2 `TemplatedNullSelection<IS_NULL>`(NULL 检查)
-
-`column_segment.cpp:378-403`:
-
-```cpp
-template <bool IS_NULL>
-static idx_t TemplatedNullSelection(UnifiedVectorFormat &vdata, SelectionVector &sel, idx_t &approved_tuple_count) {
-    auto &mask = vdata.validity;
-    if (mask.AllValid()) {
-        // no NULL values
-        if (IS_NULL) {
-            approved_tuple_count = 0;
-            return 0;
-        } else {
-            return approved_tuple_count;
-        }
-    } else {
-        ...
-        for (idx_t i = 0; i < approved_tuple_count; i++) {
-            auto idx = sel.get_index(i);
-            auto vector_idx = vdata.sel->get_index(idx);
-            if (mask.RowIsValid(vector_idx) != IS_NULL) {
-                result_sel.set_index(result_count++, idx);
-            }
-        }
-        ...
-    }
-}
-```
-
-`mask.AllValid()` 时的快速判定:`IS NULL` 直接归零,`IS NOT NULL` 直接全过 —— **O(1)**,不动 SelectionVector。
-
-### 4.6 AdaptiveFilter:按观测选择率重排序
-
-`src/execution/adaptive_filter.cpp` + `src/include/duckdb/execution/adaptive_filter.hpp`。**这是 DuckDB 一个容易被忽略但对性能影响很大的机制**。
-
-#### 4.6.1 数据结构
-
-```cpp
-class AdaptiveFilter {
-public:
-    explicit AdaptiveFilter(const Expression &expr);
-    explicit AdaptiveFilter(const TableFilterSet &table_filters);
-
-    vector<idx_t> permutation;   // 当前执行顺序
-
-public:
-    void AdaptRuntimeStatistics(double duration);
-    AdaptiveFilterState BeginFilter() const;
-    void EndFilter(AdaptiveFilterState state);
-
-private:
-    bool disable_permutations = false;
-    idx_t iteration_count = 0;
-    idx_t swap_idx = 0;
-    idx_t right_random_border = 0;
-    idx_t observe_interval = 0;       // = 10
-    idx_t execute_interval = 0;       // = 20
-    double runtime_sum = 0;
-    double prev_mean = 0;
-    bool observe = false;
-    bool warmup = false;
-    vector<idx_t> swap_likeliness;    // 每个相邻位置的换位概率(初始 100)
-    RandomEngine generator;
-};
-```
-
-构造期初始顺序由 `ExpressionHeuristics::GetInitialOrder(table_filters)` 给出(把贵的 filter 排后);随后通过 ε-greedy 在线学习。
-
-#### 4.6.2 调度与学习
-
-`RowGroup::Scan` 的 hot loop(`row_group.cpp:659-664`):
-
-```cpp
-auto adaptive_filter = filter_info.GetAdaptiveFilter();
-auto filter_state = filter_info.BeginFilter();
-if (has_filters) {
-    auto &filter_list = filter_info.GetFilterList();
-    for (idx_t i = 0; i < filter_list.size(); i++) {
-        auto filter_idx = adaptive_filter->permutation[i];   // ← 按学到的 permutation 执行
-        ...
-```
-
-vector 级算完后 `EndFilter` 记录时间,统计积累到一定 vector 数(`execute_interval=20`)后,**尝试随机交换两个相邻 filter**;再观察 `observe_interval=10` 个 vector 看 runtime 是否下降,下降则保留,不下降则撤销并降低这个位置的换位概率(`adaptive_filter.cpp:52-110`):
-
-```cpp
-void AdaptiveFilter::AdaptRuntimeStatistics(double duration) {
-    iteration_count++;
-    runtime_sum += duration;
-    if (!warmup) {
-        if (observe && iteration_count == observe_interval) {
-            // 观察期结束:看 runtime 是否下降
-            if (prev_mean - (runtime_sum / static_cast<double>(iteration_count)) <= 0) {
-                // 没下降,撤销 swap
-                std::swap(permutation[swap_idx], permutation[swap_idx + 1]);
-                if (swap_likeliness[swap_idx] > 1) swap_likeliness[swap_idx] /= 2;   // 降低后续 swap 概率
-            } else {
-                // 下降,保留 swap,重置概率
-                swap_likeliness[swap_idx] = 100;
-            }
-            observe = false;
-            ...
-        } else if (!observe && iteration_count == execute_interval) {
-            // 执行期结束:尝试新 swap
-            prev_mean = runtime_sum / static_cast<double>(iteration_count);
-            auto random_number = generator.NextRandomInteger(1, NumericCast<uint32_t>(right_random_border));
-            swap_idx = random_number / 100;
-            idx_t likeliness = random_number - 100 * swap_idx;
-            if (swap_likeliness[swap_idx] > likeliness) {
-                std::swap(permutation[swap_idx], permutation[swap_idx + 1]);
-                observe = true;
-            }
-            ...
-        }
-    } else {
-        if (iteration_count == 5) { warmup = false; }
-    }
-}
-```
-
-#### 4.6.3 为什么重要
-
-`x > 5 AND y < 100` 哪个先跑取决于数据分布:
-- 如果 90% 的行满足 `x > 5`、10% 的行满足 `y < 100`,先跑 `y < 100` 把 sel 收到 10%,再跑 `x > 5` 在 10% 的数据上跑 —— 总成本 ≈ 1×N(y filter) + 0.1×N(x filter);
-- 反过来先跑 `x > 5` → 总成本 ≈ 1×N + 0.9×N。
-
-**两种顺序差 1.8×**,而数据分布在 plan 期通常不可知。AdaptiveFilter 在线学到最优 permutation,常见 ClickBench / TPC-H query 上有显著收益。
-
-### 4.7 全段流程整合(伪代码)
-
-```
-RowGroup::Scan(state, result):
-  while !done:
-    if state.vector_index * STANDARD_VECTOR_SIZE >= state.max_row_group_row: return
-
-    # (1) sampling
-    if sampling and skip: NextVector(state); continue
-
-    # (2) segment 级 zone-map(可一次跳多 vector)
-    if !CheckZonemapSegments(state): continue
-
-    # (3) MVCC + 删除可见性
-    count = current_row_group.GetSelVector(...)
-    if count == 0: NextVector(state); continue
-
-    # (4) 预取
-    if block_manager.Prefetch(): ...InitializePrefetch...; buffer_manager.Prefetch(...)
-
-    # (5) fast path:无 filter + 无删除
-    if count == max_count and !has_filters:
-      for col in column_ids: col_data.Scan(...)
-      return have_chunk
-
-    # (6) partial path
-    sel = SelectionVector(initial)
-    approved_tuple_count = count
-
-    # (6a) AdaptiveFilter 决定顺序,逐 filter 收窄 sel
-    adaptive_filter = filter_info.GetAdaptiveFilter()
-    BeginFilter()
-    for i in 0..N_filters:
-      filter_idx = adaptive_filter->permutation[i]
-      if filter.IsAlwaysTrue(): continue
-      col_data.Filter(transaction, vector_index, scan_state, result_vector,
-                      sel, approved_tuple_count, filter, table_filter_state)
-
-    # (6b) 一次性 Slice filter 列
-    for f in filter_list: result.data[f.scan_column_index].Slice(sel, approved_tuple_count)
-
-    # (6c) 全过滤掉 → 跳整 vector,推进所有列的 offset
-    if approved_tuple_count == 0:
-      for col not in filter_list: col_data.Skip(...)
-      state.vector_index++; continue
-
-    # (6d) late materialization:只为命中行 Select 其它列
-    for col in column_ids:
-      if col in filter_list: continue
-      col_data.Select(transaction, vector_index, scan_state, result.data[col_idx],
-                      sel, approved_tuple_count)
-
-    EndFilter()
-    return have_chunk
-```
-
-### 4.8 关键文件清单
-
-| 路径 | 作用 |
-|---|---|
-| `src/storage/table/row_group.cpp` | `CheckZonemap` / `CheckZonemapSegments` / `Scan` 三层 zone-map |
-| `src/storage/table/column_data.cpp` | `FilterVector` / `ScanVector` / `Select` |
-| `src/storage/table/column_segment.cpp` | `FilterSelection` / `TemplatedFilterSelection<T,OP,HAS_NULL>` / `TemplatedNullSelection<IS_NULL>` 模板化 hot loop |
-| `src/execution/operator/scan/physical_table_scan.cpp` | `GetDataInternal`、dynamic filter 合并 |
-| `src/execution/adaptive_filter.cpp` + `src/include/duckdb/execution/adaptive_filter.hpp` | ε-greedy 在线学习 filter 顺序 |
+运行期集合发布和 TopN 边界更新见 [RUNTIME_FILTER_DESIGN.md](./RUNTIME_FILTER_DESIGN.md)；收益条件见 [FILTER_PERFORMANCE_DESIGN.md](./FILTER_PERFORMANCE_DESIGN.md)。本文没有执行 SQL、测量 I/O/CPU，也未验证每个压缩 codec。
